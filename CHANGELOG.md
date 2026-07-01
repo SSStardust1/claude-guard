@@ -1,5 +1,7 @@
 # Changelog
 
+更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
+
 ## 0.2.3 - 2026-07-01
 
 - 开源发布整理：新增 MIT License、Contributing、Security Policy 和 GitHub Actions 检查。
