@@ -1,0 +1,778 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.2.3"
+
+CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
+OFFICIAL_SETTINGS="${CLAUDE_GUARD_SETTINGS:-$HOME/.claude-official/settings.json}"
+CA_CERT_FILE="${CLAUDE_GUARD_CA_CERT:-/etc/ssl/cert.pem}"
+CLAUDE_PROXY_URL="${CLAUDE_GUARD_PROXY:-${CLAUDE_OFFICIAL_PROXY:-http://127.0.0.1:7897}}"
+NO_PROXY_LIST="${CLAUDE_GUARD_NO_PROXY:-${CLAUDE_OFFICIAL_NO_PROXY:-127.0.0.1,localhost,::1,.local}}"
+IP_CHECK_RETRIES="${CLAUDE_GUARD_IP_RETRIES:-${CLAUDE_OFFICIAL_IP_RETRIES:-3}}"
+IP_CHECK_URLS="${CLAUDE_GUARD_IP_CHECK_URLS:-${CLAUDE_OFFICIAL_IP_CHECK_URLS:-https://ipinfo.io/ip https://api.ipify.org}}"
+TLS_CHECK_RETRIES="${CLAUDE_GUARD_TLS_RETRIES:-${CLAUDE_OFFICIAL_TLS_RETRIES:-3}}"
+PLATFORM_TLS_MODE="${CLAUDE_GUARD_PLATFORM_TLS_MODE:-${CLAUDE_OFFICIAL_PLATFORM_TLS_MODE:-warn}}"
+ASSUME_YES="${CLAUDE_GUARD_ASSUME_YES:-0}"
+WATCHDOG_ENABLED="${CLAUDE_GUARD_WATCHDOG:-1}"
+WATCHDOG_DRY_RUN="${CLAUDE_GUARD_WATCHDOG_DRY_RUN:-1}"
+IP_INTERVAL="${CLAUDE_GUARD_IP_INTERVAL:-60}"
+API_INTERVAL="${CLAUDE_GUARD_API_INTERVAL:-180}"
+WATCHDOG_TICK_SECONDS="${CLAUDE_GUARD_WATCHDOG_TICK_SECONDS:-5}"
+WAKE_GAP_SECONDS="${CLAUDE_GUARD_WAKE_GAP_SECONDS:-120}"
+IP_BAD_THRESHOLD="${CLAUDE_GUARD_IP_BAD_THRESHOLD:-2}"
+API_BAD_THRESHOLD="${CLAUDE_GUARD_API_BAD_THRESHOLD:-3}"
+RESUME_GOOD_THRESHOLD="${CLAUDE_GUARD_RESUME_GOOD_THRESHOLD:-2}"
+KILL_AFTER_PAUSE_SECONDS="${CLAUDE_GUARD_KILL_AFTER_PAUSE_SECONDS:-}"
+LOG_FILE="${CLAUDE_GUARD_LOG_FILE:-$HOME/.claude-guard/guard.log}"
+NOTIFY_ENABLED="${CLAUDE_GUARD_NOTIFY:-0}"
+DRY_RUN_STDERR="${CLAUDE_GUARD_DRY_RUN_STDERR:-0}"
+FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
+LEGACY_PROFILE_MODE="${CLAUDE_GUARD_LEGACY_PROFILE_MODE:-warn}"
+PRECHECK_ONLY=0
+
+usage() {
+  cat <<'EOF'
+Claude 守护 - startup guard for official Claude Code
+
+Usage:
+  claude-guard [--precheck-only] [claude args...]
+  claude-guard --version
+  claude-guard --help
+
+Environment:
+  CLAUDE_GUARD_CONFIG        Safe config JSON. Default: ~/.safe-claude-official.json
+  CLAUDE_GUARD_SETTINGS      Official Claude settings. Default: ~/.claude-official/settings.json
+  CLAUDE_GUARD_PROXY         Required proxy URL. Default: http://127.0.0.1:7897
+  CLAUDE_GUARD_NO_PROXY      NO_PROXY list. Default: 127.0.0.1,localhost,::1,.local
+  CLAUDE_GUARD_ASSUME_YES    Set to 1 to skip the final Enter prompt when IP is allowed.
+  CLAUDE_GUARD_IP_CHECK_URLS Space-separated IPv4 echo endpoints.
+  CLAUDE_GUARD_WATCHDOG      Set to 0 to disable runtime guarding. Default: 1
+  CLAUDE_GUARD_WATCHDOG_DRY_RUN
+                              Default: 1. Logs would-pause/would-resume actions only.
+  CLAUDE_GUARD_DRY_RUN_STDERR
+                              Set to 1 to print dry-run pause/resume notices to stderr.
+  CLAUDE_GUARD_FINGERPRINT_MODE
+                              off, warn, fail-active, or strict. Default: fail-active.
+  CLAUDE_GUARD_LEGACY_PROFILE_MODE
+                              off, warn, or strict for ~/.claude contamination. Default: warn.
+  CLAUDE_GUARD_LOG_FILE      Default: ~/.claude-guard/guard.log
+
+The config file must contain:
+  {
+    "command": "/absolute/path/to/original/claude",
+    "allowed_ips": ["x.x.x.x"],
+    "allowed_cidrs": ["x.x.x.0/24"]
+  }
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version)
+      printf 'claude-guard %s\n' "$VERSION"
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --precheck-only)
+      PRECHECK_ONLY=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf '缺少依赖命令: %s\n' "$1" >&2
+    case "$1" in
+      curl) printf '安装建议: macOS 通常自带 curl；如缺失可执行 brew install curl\n' >&2 ;;
+      jq) printf '安装建议: brew install jq\n' >&2 ;;
+    esac
+    exit 127
+  fi
+}
+
+require_cmd curl
+require_cmd jq
+
+resolve_path() {
+  local path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$path" 2>/dev/null || printf '%s\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+clean_env() {
+  env -i \
+    HOME="$HOME" \
+    USER="${USER:-user}" \
+    PATH="$PATH" \
+    TERM="${TERM:-xterm-256color}" \
+    LANG="${LANG:-en_US.UTF-8}" \
+    LC_ALL="${LC_ALL:-en_US.UTF-8}" \
+    SHELL="${SHELL:-/bin/zsh}" \
+    "$@"
+}
+
+official_net_env() {
+  env -i \
+    HOME="$HOME" \
+    USER="${USER:-user}" \
+    PATH="$PATH" \
+    TERM="${TERM:-xterm-256color}" \
+    LANG="${LANG:-en_US.UTF-8}" \
+    LC_ALL="${LC_ALL:-en_US.UTF-8}" \
+    SHELL="${SHELL:-/bin/zsh}" \
+    HTTP_PROXY="$CLAUDE_PROXY_URL" \
+    HTTPS_PROXY="$CLAUDE_PROXY_URL" \
+    ALL_PROXY="$CLAUDE_PROXY_URL" \
+    http_proxy="$CLAUDE_PROXY_URL" \
+    https_proxy="$CLAUDE_PROXY_URL" \
+    all_proxy="$CLAUDE_PROXY_URL" \
+    NO_PROXY="$NO_PROXY_LIST" \
+    no_proxy="$NO_PROXY_LIST" \
+    SSL_CERT_FILE="$CA_CERT_FILE" \
+    NODE_EXTRA_CA_CERTS="$CA_CERT_FILE" \
+    "$@"
+}
+
+check_tls_host() {
+  local host="$1"
+  local mode="${2:-required}"
+  local out issuer reason attempt
+
+  attempt=1
+  while [ "$attempt" -le "$TLS_CHECK_RETRIES" ]; do
+    reason=''
+    if out="$(official_net_env curl -4 -x "$CLAUDE_PROXY_URL" -vI --connect-timeout 8 --max-time 15 "https://${host}/" 2>&1 >/dev/null)"; then
+      if ! printf '%s\n' "$out" | grep -Eq "CONNECT ${host}:443|CONNECT tunnel established|CONNECT phase completed"; then
+        reason="${host} 没有走 ${CLAUDE_PROXY_URL} 的 HTTP CONNECT 隧道"
+      elif ! printf '%s\n' "$out" | grep -q 'SSL certificate verify ok'; then
+        reason="${host} 未显示证书验证通过"
+      else
+        issuer="$(printf '%s\n' "$out" | sed -n 's/.*issuer: //p' | head -1)"
+        if [ -z "$issuer" ]; then
+          reason="无法读取 ${host} 的证书 issuer"
+        else
+          case "$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')" in
+            *charles*|*mitm*|*fiddler*|*zscaler*|*clash*|*surge*|*proxy*)
+              reason="${host} 的证书 issuer 疑似代理/MITM: ${issuer}"
+              ;;
+            *)
+              printf 'TLS 预检通过：%s via %s issuer=%s\n' "$host" "$CLAUDE_PROXY_URL" "$issuer"
+              return 0
+              ;;
+          esac
+        fi
+      fi
+    else
+      reason="无法连接或验证 ${host} 的证书"
+    fi
+
+    if [ "$attempt" -lt "$TLS_CHECK_RETRIES" ]; then
+      printf 'TLS 预检重试：%s 第 %s/%s 次失败：%s\n' "$host" "$attempt" "$TLS_CHECK_RETRIES" "$reason" >&2
+      sleep 1
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  if [ "$mode" = "warn" ]; then
+    printf 'TLS 预检警告：%s 经过 %s 次尝试仍未稳定通过：%s\n' "$host" "$TLS_CHECK_RETRIES" "$reason" >&2
+    printf '%s\n' "$out" | grep -Ei 'certificate|issuer|subject|SSL|error|CONNECT' >&2 || true
+    return 0
+  fi
+
+  printf 'TLS 预检失败：%s 经过 %s 次尝试仍未通过：%s\n' "$host" "$TLS_CHECK_RETRIES" "$reason" >&2
+  printf '%s\n' "$out" | grep -Ei 'certificate|issuer|subject|SSL|error|CONNECT' >&2 || true
+  exit 7
+}
+
+check_anthropic_ipv6_blocked() {
+  local out remote_ip
+
+  if out="$(clean_env curl -6 -sS -o /dev/null -w 'remote_ip=%{remote_ip} http=%{http_code}' --connect-timeout 3 --max-time 6 https://api.anthropic.com/ 2>/dev/null)"; then
+    remote_ip="$(printf '%s\n' "$out" | sed -n 's/.*remote_ip=\([^ ]*\).*/\1/p')"
+    case "$remote_ip" in
+      ::ffff:198.18.*|::ffff:198.19.*|198.18.*|198.19.*)
+        printf 'IPv6 预检通过：api.anthropic.com 仅返回 Mihomo/Clash fake-ip 映射 %s，不是公网 IPv6 出口。\n' "$remote_ip"
+        return 0
+        ;;
+      ::ffff:*)
+        printf 'IPv6 预检通过：api.anthropic.com 返回 IPv4-mapped 地址 %s，不是公网 IPv6 出口。\n' "$remote_ip"
+        return 0
+        ;;
+    esac
+    printf 'IPv6 预检失败：api.anthropic.com 仍可通过 IPv6 访问，已拒绝启动。\n' >&2
+    printf '当前结果：%s\n' "$out" >&2
+    printf '请先关闭 Clash/Mihomo IPv6，确保 Claude 官方链路压在 IPv4。\n' >&2
+    exit 8
+  fi
+
+  printf 'IPv6 预检通过：api.anthropic.com IPv6 不可达，Claude 官方链路将压在 IPv4。\n'
+}
+
+log_guard() {
+  local level="$1"
+  local message="$2"
+  local dir timestamp
+
+  timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  dir="$(dirname "$LOG_FILE")"
+  mkdir -p "$dir"
+  printf '%s [%s] %s\n' "$timestamp" "$level" "$message" >>"$LOG_FILE"
+}
+
+notify_guard() {
+  local message="$1"
+
+  if [ "$NOTIFY_ENABLED" != "1" ] || ! command -v osascript >/dev/null 2>&1; then
+    return 0
+  fi
+
+  osascript -e "display notification \"${message//\"/\\\"}\" with title \"Claude Guardian\"" >/dev/null 2>&1 || true
+}
+
+current_timezone() {
+  node -e 'console.log(Intl.DateTimeFormat().resolvedOptions().timeZone || "")' 2>/dev/null || true
+}
+
+redact_value() {
+  local value="$1"
+
+  if [ "${#value}" -le 12 ]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s...\n' "${value:0:8}"
+  fi
+}
+
+client_scan_files() {
+  local file="$1"
+  local dir package_root="" scope_dir
+
+  file="$(resolve_path "$file")"
+  printf '%s\n' "$file"
+
+  dir="$file"
+  while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+    if [ "$(basename "$dir")" = "claude-code" ] && [ "$(basename "$(dirname "$dir")")" = "@anthropic-ai" ]; then
+      package_root="$dir"
+      break
+    fi
+    dir="$(dirname "$dir")"
+  done
+
+  if [ -n "$package_root" ]; then
+    scope_dir="$(dirname "$package_root")"
+    find "$scope_dir" -maxdepth 3 -type f \( -name 'claude' -o -name 'claude.exe' -o -name 'cli.js' -o -name 'cli-wrapper.cjs' \) 2>/dev/null
+  fi
+}
+
+find_client_fingerprint_marker() {
+  local file="$1"
+  local scan_file seen=":"
+
+  while IFS= read -r scan_file; do
+    [ -n "$scan_file" ] || continue
+    case "$seen" in
+      *:"$scan_file":*) continue ;;
+    esac
+    seen="${seen}${scan_file}:"
+    [ -r "$scan_file" ] || continue
+    if LC_ALL=C grep -aEq 'Asia/Shanghai|Asia/Urumqi' "$scan_file" &&
+      LC_ALL=C grep -aEq '\\u02BC|\\u02B9|Today.*date is|date is.*replaceAll|date is.*replace\(' "$scan_file"; then
+      printf '%s\n' "$scan_file"
+      return 0
+    fi
+  done <<EOF
+$(client_scan_files "$file")
+EOF
+
+  return 1
+}
+
+check_legacy_profile_contamination() {
+  local profile="$HOME/.claude/settings.json"
+  local marker_re='ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED|CLAUDE_CODE_USE_GATEWAY'
+
+  [ "$LEGACY_PROFILE_MODE" = "off" ] && return 0
+  [ -f "$profile" ] || return 0
+  if ! grep -Eiq "$marker_re" "$profile"; then
+    return 0
+  fi
+
+  if [ "$LEGACY_PROFILE_MODE" = "strict" ]; then
+    printf '旧默认 Claude profile 含有反代/凭据注入残留，strict 模式已拒绝启动: %s\n' "$profile" >&2
+    grep -Ein "$marker_re" "$profile" >&2 || true
+    exit 11
+  fi
+
+  printf '旧默认 Claude profile 命中反代/凭据注入残留，但官方入口使用 CLAUDE_CONFIG_DIR=%s，按 warn 模式继续。\n' "$HOME/.claude-official" >&2
+  log_guard "WARN" "legacy profile contains proxy/auth markers path=${profile}; official profile remains isolated"
+}
+
+check_client_fingerprint_tripwire() {
+  local claude_bin="$1"
+  local resolved_bin tz active_reasons marker_found=0 current_base_url marker_file
+
+  case "$FINGERPRINT_MODE" in
+    off|warn|fail-active|strict) ;;
+    *)
+      printf 'CLAUDE_GUARD_FINGERPRINT_MODE 只能是 off、warn、fail-active 或 strict，当前是: %s\n' "$FINGERPRINT_MODE" >&2
+      exit 10
+      ;;
+  esac
+
+  [ "$FINGERPRINT_MODE" = "off" ] && return 0
+
+  resolved_bin="$(resolve_path "$claude_bin")"
+  marker_file="$(find_client_fingerprint_marker "$resolved_bin" || true)"
+  if [ -n "$marker_file" ]; then
+    marker_found=1
+  fi
+
+  if [ "$marker_found" -ne 1 ]; then
+    printf '客户端指纹预检通过：未发现已知 date/time watermark 逻辑。\n'
+    return 0
+  fi
+
+  tz="$(current_timezone)"
+  current_base_url="${ANTHROPIC_BASE_URL:-}"
+  active_reasons=""
+
+  if [ -n "$current_base_url" ]; then
+    active_reasons="${active_reasons} ANTHROPIC_BASE_URL=$(redact_value "$current_base_url")"
+  fi
+  case "$tz" in
+    Asia/Shanghai|Asia/Urumqi)
+      active_reasons="${active_reasons} timezone=${tz}"
+      ;;
+  esac
+
+  if [ "$FINGERPRINT_MODE" = "strict" ]; then
+    printf '客户端指纹预检失败：%s 含有已知 date/time watermark 逻辑，strict 模式拒绝启动。\n' "$marker_file" >&2
+    exit 10
+  fi
+
+  if [ -n "$active_reasons" ]; then
+    if [ "$FINGERPRINT_MODE" = "fail-active" ]; then
+      printf '客户端指纹预检失败：%s 含有已知 date/time watermark 逻辑，且存在激活条件:%s\n' "$marker_file" "$active_reasons" >&2
+      printf '请清理 ANTHROPIC_BASE_URL 或改用干净 timezone/profile 后再启动官方 Claude。\n' >&2
+      exit 10
+    fi
+    printf '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，且存在激活条件:%s\n' "$marker_file" "$active_reasons" >&2
+    log_guard "WARN" "watermark-capable client with active conditions:${active_reasons}"
+    return 0
+  fi
+
+  printf '客户端指纹预检警告：%s 含有已知 date/time watermark 逻辑，但当前官方环境未发现激活条件，继续。\n' "$marker_file" >&2
+  log_guard "WARN" "watermark-capable client detected without active conditions path=${marker_file}"
+}
+
+is_ipv4() {
+  local ip="$1"
+  local a b c d
+
+  IFS=. read -r a b c d <<EOF
+$ip
+EOF
+  for part in "$a" "$b" "$c" "$d"; do
+    case "$part" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    if [ "$part" -lt 0 ] || [ "$part" -gt 255 ]; then
+      return 1
+    fi
+  done
+  [ -n "$d" ] || return 1
+  return 0
+}
+
+ipv4_to_int() {
+  local ip="$1"
+  local a b c d
+
+  IFS=. read -r a b c d <<EOF
+$ip
+EOF
+  printf '%u\n' "$(( (a << 24) + (b << 16) + (c << 8) + d ))"
+}
+
+cidr_contains_ip() {
+  local ip="$1"
+  local cidr="$2"
+  local base prefix ip_num base_num mask
+
+  base="${cidr%/*}"
+  prefix="${cidr#*/}"
+  is_ipv4 "$ip" || return 1
+  is_ipv4 "$base" || return 1
+  case "$prefix" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$prefix" -lt 0 ] || [ "$prefix" -gt 32 ]; then
+    return 1
+  fi
+
+  ip_num="$(ipv4_to_int "$ip")"
+  base_num="$(ipv4_to_int "$base")"
+  if [ "$prefix" -eq 0 ]; then
+    mask=0
+  else
+    mask="$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))"
+  fi
+  [ "$((ip_num & mask))" -eq "$((base_num & mask))" ]
+}
+
+get_current_ip_once() {
+  local url ip
+
+  for url in $IP_CHECK_URLS; do
+    ip="$(official_net_env curl -4 -x "$CLAUDE_PROXY_URL" -fsS --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if is_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_allowed_ip() {
+  local ip="$1"
+  local cidr
+
+  if jq -e --arg ip "$ip" '.allowed_ips // [] | index($ip)' "$CONFIG_FILE" >/dev/null; then
+    return 0
+  fi
+
+  while IFS= read -r cidr; do
+    [ -n "$cidr" ] || continue
+    if cidr_contains_ip "$ip" "$cidr"; then
+      return 0
+    fi
+  done <<EOF
+$(jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | .[] | select(type == "string" and contains("/"))' "$CONFIG_FILE")
+EOF
+
+  return 1
+}
+
+check_api_path_once() {
+  local out issuer
+
+  if ! out="$(official_net_env curl -4 -x "$CLAUDE_PROXY_URL" -vI --connect-timeout 8 --max-time 15 https://api.anthropic.com/ 2>&1 >/dev/null)"; then
+    return 1
+  fi
+  printf '%s\n' "$out" | grep -Eq "CONNECT api.anthropic.com:443|CONNECT tunnel established|CONNECT phase completed" || return 1
+  printf '%s\n' "$out" | grep -q 'SSL certificate verify ok' || return 1
+  issuer="$(printf '%s\n' "$out" | sed -n 's/.*issuer: //p' | head -1)"
+  [ -n "$issuer" ] || return 1
+  case "$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')" in
+    *charles*|*mitm*|*fiddler*|*zscaler*|*clash*|*surge*|*proxy*) return 1 ;;
+  esac
+  return 0
+}
+
+pause_target() {
+  local target_pid="$1"
+  local reason="$2"
+
+  if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
+    log_guard "WARN" "DRY RUN: would pause Claude pid=${target_pid}; reason=${reason}"
+    if [ "$DRY_RUN_STDERR" = "1" ]; then
+      printf '\nClaude Guardian dry-run: would pause Claude because %s\n' "$reason" >&2
+    fi
+    notify_guard "Dry-run: would pause Claude because ${reason}"
+    return 0
+  fi
+
+  printf 'Claude Guardian action mode is disabled in v%s because this launcher preserves Claude as the foreground TUI process and cannot safely pause the whole process group yet. Keep CLAUDE_GUARD_WATCHDOG_DRY_RUN=1.\n' "$VERSION" >&2
+  log_guard "ERROR" "action mode refused; unsafe to pause only pid=${target_pid}; reason=${reason}"
+  return 1
+}
+
+resume_target() {
+  local target_pid="$1"
+  local reason="$2"
+
+  if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
+    log_guard "INFO" "DRY RUN: would resume Claude pid=${target_pid}; reason=${reason}"
+    if [ "$DRY_RUN_STDERR" = "1" ]; then
+      printf '\nClaude Guardian dry-run: would resume Claude because %s\n' "$reason" >&2
+    fi
+    notify_guard "Dry-run: would resume Claude because ${reason}"
+    return 0
+  fi
+
+  printf 'Claude Guardian action mode is disabled in v%s; cannot resume pid=%s safely.\n' "$VERSION" "$target_pid" >&2
+  log_guard "ERROR" "action mode refused; unsafe to resume only pid=${target_pid}; reason=${reason}"
+  return 1
+}
+
+run_watchdog() {
+  local target_pid="$1"
+  local state="healthy"
+  local current_ip=""
+  local ip_ok=0
+  local api_ok=1
+  local ip_bad_count=0
+  local api_bad_count=0
+  local resume_good_count=0
+  local paused_since=0
+  local last_tick now next_ip_check next_api_check reason
+
+  last_tick="$(date +%s)"
+  next_ip_check="$last_tick"
+  next_api_check="$last_tick"
+  log_guard "INFO" "watchdog started pid=${target_pid} proxy=${CLAUDE_PROXY_URL} dry_run=${WATCHDOG_DRY_RUN}"
+
+  while kill -0 "$target_pid" 2>/dev/null; do
+    now="$(date +%s)"
+
+    if [ $((now - last_tick)) -gt "$WAKE_GAP_SECONDS" ]; then
+      log_guard "WARN" "wake gap detected gap_seconds=$((now - last_tick)) state=${state}"
+      if [ "$state" = "paused" ]; then
+        state="resume-pending"
+      else
+        state="degraded"
+      fi
+      next_ip_check="$now"
+      next_api_check="$now"
+    fi
+    last_tick="$now"
+
+    if [ "$now" -ge "$next_ip_check" ]; then
+      current_ip="$(get_current_ip_once || true)"
+      if [ -n "$current_ip" ] && is_allowed_ip "$current_ip"; then
+        ip_ok=1
+        ip_bad_count=0
+      else
+        ip_ok=0
+        ip_bad_count=$((ip_bad_count + 1))
+        if [ -n "$current_ip" ]; then
+          log_guard "WARN" "exit ip not allowed ip=${current_ip} count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
+        else
+          log_guard "WARN" "exit ip unknown count=${ip_bad_count}/${IP_BAD_THRESHOLD} state=${state}"
+        fi
+      fi
+      next_ip_check=$((now + IP_INTERVAL))
+    fi
+
+    if [ "$now" -ge "$next_api_check" ] || [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
+      if check_api_path_once; then
+        api_ok=1
+        api_bad_count=0
+      else
+        api_ok=0
+        api_bad_count=$((api_bad_count + 1))
+        log_guard "WARN" "api path unhealthy count=${api_bad_count}/${API_BAD_THRESHOLD} state=${state}"
+      fi
+      next_api_check=$((now + API_INTERVAL))
+    fi
+
+    if [ "$state" = "paused" ] || [ "$state" = "resume-pending" ]; then
+      if [ "$ip_ok" -eq 1 ] && [ "$api_ok" -eq 1 ]; then
+        state="resume-pending"
+        resume_good_count=$((resume_good_count + 1))
+        log_guard "INFO" "resume candidate count=${resume_good_count}/${RESUME_GOOD_THRESHOLD} ip=${current_ip:-unknown}"
+        if [ "$resume_good_count" -ge "$RESUME_GOOD_THRESHOLD" ]; then
+          reason="route healthy again ip=${current_ip:-unknown}"
+          resume_target "$target_pid" "$reason" || true
+          state="healthy"
+          resume_good_count=0
+          paused_since=0
+        fi
+      else
+        state="paused"
+        resume_good_count=0
+      fi
+    elif [ "$ip_bad_count" -ge "$IP_BAD_THRESHOLD" ]; then
+      state="paused"
+      paused_since="$now"
+      reason="exit IP unsafe ip=${current_ip:-unknown}"
+      pause_target "$target_pid" "$reason" || true
+    elif [ "$api_bad_count" -ge "$API_BAD_THRESHOLD" ]; then
+      state="paused"
+      paused_since="$now"
+      reason="api path unhealthy"
+      pause_target "$target_pid" "$reason" || true
+    elif [ "$ip_ok" -eq 1 ] && [ "$api_ok" -eq 1 ]; then
+      if [ "$state" != "healthy" ]; then
+        log_guard "INFO" "route healthy ip=${current_ip:-unknown}"
+      fi
+      state="healthy"
+    else
+      state="degraded"
+    fi
+
+    if [ -n "$KILL_AFTER_PAUSE_SECONDS" ] && [ "$state" = "paused" ] && [ "$paused_since" -gt 0 ]; then
+      if [ $((now - paused_since)) -ge "$KILL_AFTER_PAUSE_SECONDS" ]; then
+        log_guard "ERROR" "kill-after-pause reached but automatic kill is not implemented in v${VERSION}; pid=${target_pid}"
+      fi
+    fi
+
+    sleep "$WATCHDOG_TICK_SECONDS"
+  done
+
+  log_guard "INFO" "watchdog exiting because Claude pid=${target_pid} is gone"
+}
+
+start_watchdog_sidecar() {
+  if [ "$WATCHDOG_ENABLED" != "1" ]; then
+    return 0
+  fi
+
+  if [ "$WATCHDOG_DRY_RUN" != "1" ]; then
+    printf 'Claude Guardian action mode is not enabled in v%s. This version defaults to dry-run observation so it cannot accidentally pause only the main PID.\n' "$VERSION" >&2
+    printf 'Please use CLAUDE_GUARD_WATCHDOG_DRY_RUN=1, observe logs, and enable real pause/resume after process-group runner support lands.\n' >&2
+    exit 9
+  fi
+
+  run_watchdog "$$" &
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  printf 'IP 安全配置不存在: %s\n' "$CONFIG_FILE" >&2
+  printf '请创建配置，例如 {"command":"/path/to/claude","allowed_ips":["x.x.x.x"],"allowed_cidrs":["x.x.x.0/24"]}\n' >&2
+  exit 2
+fi
+
+CLAUDE_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
+if [ -z "$CLAUDE_BIN" ]; then
+  printf '配置中的 command 不能为空。\n' >&2
+  exit 2
+fi
+case "$CLAUDE_BIN" in
+  /*) ;;
+  *)
+    printf '配置中的 command 必须是原始 Claude CLI 的绝对路径，不能写成: %s\n' "$CLAUDE_BIN" >&2
+    exit 2
+    ;;
+esac
+if [ "$CLAUDE_BIN" = "$0" ]; then
+  printf '配置中的 command 指向了 claude-guard 自己，会造成递归调用: %s\n' "$CLAUDE_BIN" >&2
+  exit 2
+fi
+if [ ! -x "$CLAUDE_BIN" ]; then
+  printf '配置中的 command 不存在或不可执行: %s\n' "$CLAUDE_BIN" >&2
+  exit 2
+fi
+
+if [ ! -f "$OFFICIAL_SETTINGS" ]; then
+  printf '官方旁路 settings 不存在: %s\n' "$OFFICIAL_SETTINGS" >&2
+  exit 2
+fi
+
+if [ ! -f "$CA_CERT_FILE" ]; then
+  printf '系统 CA bundle 不存在，已拒绝启动: %s\n' "$CA_CERT_FILE" >&2
+  exit 2
+fi
+
+if grep -Eiq 'ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED' "$OFFICIAL_SETTINGS"; then
+  printf '官方旁路 settings 含有疑似反代/凭据注入配置，已拒绝启动: %s\n' "$OFFICIAL_SETTINGS" >&2
+  grep -Ein 'ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED' "$OFFICIAL_SETTINGS" >&2 || true
+  exit 5
+fi
+
+check_legacy_profile_contamination
+check_client_fingerprint_tripwire "$CLAUDE_BIN"
+
+for arg in "$@"; do
+  case "$arg" in
+    fable5|claude-fable5|claude-fable-5-latest)
+      printf '模型名 %s 不安全或不存在。请使用 fable 或 claude-fable-5。\n' "$arg" >&2
+      exit 6
+      ;;
+  esac
+done
+
+attempt=1
+CURRENT_IP=''
+while [ "$attempt" -le "$IP_CHECK_RETRIES" ]; do
+  if CURRENT_IP="$(get_current_ip_once)" && [ -n "$CURRENT_IP" ]; then
+    break
+  fi
+  if [ "$attempt" -lt "$IP_CHECK_RETRIES" ]; then
+    printf 'IP 检查重试：第 %s/%s 次无法从任一 IP 源获取有效 IPv4。\n' "$attempt" "$IP_CHECK_RETRIES" >&2
+    sleep 1
+  fi
+  attempt=$((attempt + 1))
+done
+if [ -z "$CURRENT_IP" ]; then
+  printf 'IP 检查失败：无法获取当前出口 IP。\n' >&2
+  exit 3
+fi
+
+printf 'Claude Official 网络路径：%s，NO_PROXY=%s\n' "$CLAUDE_PROXY_URL" "$NO_PROXY_LIST"
+check_tls_host api.anthropic.com
+check_tls_host platform.claude.com "$PLATFORM_TLS_MODE"
+check_anthropic_ipv6_blocked
+
+if is_allowed_ip "$CURRENT_IP"; then
+  printf 'IP 检查通过：%s\n' "$CURRENT_IP"
+  if [ "$PRECHECK_ONLY" = "1" ]; then
+    printf '预检完成：未启动 Claude。\n'
+    exit 0
+  fi
+  if [ "$ASSUME_YES" != "1" ]; then
+    printf '按回车继续执行 Claude Official，或按 Ctrl+C 取消。'
+    read -r _
+  fi
+else
+  printf 'IP 检查失败：%s\n' "$CURRENT_IP" >&2
+  printf '正在使用未授权的网络环境。\n' >&2
+  printf '允许的出口 IP/CIDR: ' >&2
+  jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | join(", ")' "$CONFIG_FILE" >&2
+  if [ "$PRECHECK_ONLY" = "1" ]; then
+    printf '预检失败：未启动 Claude。\n' >&2
+    exit 4
+  fi
+  printf '如确认要冒险继续，请输入 unsafe 后回车；直接回车将退出: ' >&2
+  read -r answer
+  if [ "$answer" != "unsafe" ]; then
+    printf '已退出，未启动 Claude Official。\n' >&2
+    exit 4
+  fi
+  printf '已手动确认 unsafe，继续执行。\n' >&2
+fi
+
+start_watchdog_sidecar
+
+exec env -i \
+  HOME="$HOME" \
+  USER="${USER:-user}" \
+  PATH="$PATH" \
+  TERM="${TERM:-xterm-256color}" \
+  LANG="${LANG:-en_US.UTF-8}" \
+  LC_ALL="${LC_ALL:-en_US.UTF-8}" \
+  SHELL="${SHELL:-/bin/zsh}" \
+  HTTP_PROXY="$CLAUDE_PROXY_URL" \
+  HTTPS_PROXY="$CLAUDE_PROXY_URL" \
+  ALL_PROXY="$CLAUDE_PROXY_URL" \
+  http_proxy="$CLAUDE_PROXY_URL" \
+  https_proxy="$CLAUDE_PROXY_URL" \
+  all_proxy="$CLAUDE_PROXY_URL" \
+  NO_PROXY="$NO_PROXY_LIST" \
+  no_proxy="$NO_PROXY_LIST" \
+  CLAUDE_CONFIG_DIR="$HOME/.claude-official" \
+  DISABLE_TELEMETRY="1" \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" \
+  CLAUDE_CODE_CERT_STORE="system" \
+  SSL_CERT_FILE="$CA_CERT_FILE" \
+  NODE_EXTRA_CA_CERTS="$CA_CERT_FILE" \
+  "$CLAUDE_BIN" \
+  --setting-sources= \
+  --settings "$OFFICIAL_SETTINGS" \
+  "$@"
