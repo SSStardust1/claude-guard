@@ -18,8 +18,8 @@ Claude 守护是一个给官方 Claude Code CLI 使用的启动前门禁。它�
 - TLS 证书是否由正常公共 CA 签发，且未出现 Charles、mitmproxy、Fiddler、ZScaler 等中间人痕迹。
 - `api.anthropic.com` 是否无法通过公网 IPv6 直连，确保官方链路压在 IPv4；Mihomo/Clash fake-ip 的 `::ffff:198.18.x.x` 不会被误判为公网 IPv6。
 - 官方 profile 的 `settings.json` 是否包含 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`apiKeyHelper`、`127.0.0.1:15721`、`PROXY_MANAGED` 等高风险残留。
-- 原始 Claude Code 客户端是否含有已知 date/time watermark 逻辑；如同时存在 `ANTHROPIC_BASE_URL` 或高风险时区等激活条件，则拒绝启动。
-- 模型参数中是否误写 `fable5` 一类不存在或不安全的别名。
+- 原始 Claude Code 客户端是否存在异常的 date/time 相关注入逻辑；如同时存在 `ANTHROPIC_BASE_URL` 或高风险时区等激活条件，则拒绝启动。
+- 模型参数中是否误写了不存在或不安全的模型别名。
 
 启动后会默认启动 dry-run guardian：
 
