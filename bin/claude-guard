@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.4"
+VERSION="1.0.0"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS="${CLAUDE_GUARD_SETTINGS:-$HOME/.claude-official/settings.json}"
@@ -393,6 +393,35 @@ check_cli_policy() {
         exit 13
         ;;
     esac
+  done
+}
+
+check_model_policy() {
+  local expect_model=0
+  local arg model
+
+  for arg in "$@"; do
+    model=""
+    if [ "$expect_model" -eq 1 ]; then
+      model="$arg"
+      expect_model=0
+    else
+      case "$arg" in
+        --model)
+          expect_model=1
+          ;;
+        --model=*)
+          model="${arg#--model=}"
+          ;;
+      esac
+    fi
+
+    [ -n "$model" ] || continue
+    if jq -e --arg model "$model" \
+      '(.blocked_models // []) | index($model)' "$CONFIG_FILE" >/dev/null; then
+      printf '模型 %s 位于本机 blocked_models 清单，已拒绝启动。\n' "$model" >&2
+      exit 6
+    fi
   done
 }
 
@@ -934,18 +963,10 @@ fi
 check_official_settings_policy
 check_project_settings_policy
 check_cli_policy "$@"
+check_model_policy "$@"
 check_client_identity "$CLAUDE_BIN"
 check_legacy_profile_contamination
 check_client_fingerprint_tripwire "$CLAUDE_BIN"
-
-for arg in "$@"; do
-  case "$arg" in
-    fable5|claude-fable5|claude-fable-5-latest)
-      printf '模型名 %s 不安全或不存在。请使用 fable 或 claude-fable-5。\n' "$arg" >&2
-      exit 6
-      ;;
-  esac
-done
 
 attempt=1
 CURRENT_IP=''

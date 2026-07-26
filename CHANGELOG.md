@@ -2,6 +2,22 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 1.0.0 - 2026-07-26
+
+- 将项目从单一官方入口门禁升级为明确的双通道版本策略。
+- `claude` / `claude-official` 继续进入受守护的官方 profile，并固定经过验包的客户端。
+- 新增独立 `claude-cc` launcher，面向本机 CC Switch compatibility endpoint，可独立跟进较新的 Claude Code 工程能力。
+- CC 通道固定客户端版本、SHA-256 和可选 macOS Team ID，关闭自动更新，升级必须经过显式验包和测试。
+- CC 通道要求 base URL 与配置中的本机 loopback 端点完全一致，并在启动前检查端点可达。
+- CC 通道默认要求 `PROXY_MANAGED` token 模式且 profile 不存在 `.credentials.json`，避免官方 OAuth/API 凭据混入第三方兼容链路。
+- 清除父进程继承的官方路由、provider 和生命周期限制变量，再显式加载固定的 CC Switch profile。
+- CC 通道关闭 telemetry、OTel exporter、非必要网络流量和自动更新，不影响核心工程能力。
+- 拒绝项目设置或命令行参数覆盖 CC Switch 路由和 settings source。
+- 新增 `scripts/install-cc-entrypoint.sh`、示例配置和完整 CC 通道回归测试。
+- 将 Claude Code `2.1.170` 定义为重要的历史回退基线；它不是“官方安全认证版本”，也不应被自动覆盖或误删。
+- 发布时验证的双通道客户端为 `2.1.220`；模型是否出现或可用仍由对应服务端/网关决定。
+- 移除旧版硬编码模型名称拦截，改为可选 `blocked_models` 清单，避免模型代际更新后 Guard 误伤新模型。
+
 ## 0.2.4 - 2026-07-26
 
 - 新增生命周期 fail-closed：要求关闭 background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link registration 和自动更新。

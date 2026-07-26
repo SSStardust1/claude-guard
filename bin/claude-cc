@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+CONFIG_FILE="${CLAUDE_CC_CONFIG:-$HOME/.safe-claude-cc.json}"
+PRECHECK_ONLY=0
+ROUTE_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|CLAUDE_CONFIG_DIR|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY)'
+
+usage() {
+  cat <<'EOF'
+Claude CC lane launcher
+
+Usage:
+  claude-cc [claude args...]
+  claude-cc --precheck-only
+  claude-cc --launcher-version
+  claude-cc --help-launcher
+
+This launcher is for a local CC Switch compatibility endpoint. It does not use
+the guarded official OAuth profile and does not perform Anthropic IP checks.
+
+Environment:
+  CLAUDE_CC_CONFIG   Config JSON. Default: ~/.safe-claude-cc.json
+EOF
+}
+
+case "${1:-}" in
+  --launcher-version)
+    printf 'claude-cc launcher %s\n' "$VERSION"
+    exit 0
+    ;;
+  --help-launcher)
+    usage
+    exit 0
+    ;;
+  --precheck-only)
+    PRECHECK_ONLY=1
+    shift
+    ;;
+esac
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf '缺少依赖命令: %s\n' "$1" >&2
+    exit 127
+  fi
+}
+
+require_cmd curl
+require_cmd jq
+
+resolve_path() {
+  local path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$path" 2>/dev/null || printf '%s\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+sha256_file() {
+  local file="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+    return 0
+  fi
+
+  printf '缺少 SHA-256 校验工具；需要 shasum 或 sha256sum。\n' >&2
+  return 1
+}
+
+validate_json_file() {
+  local file="$1"
+  local label="$2"
+
+  if ! jq empty "$file" >/dev/null 2>&1; then
+    printf '%s 不是有效 JSON，已拒绝启动: %s\n' "$label" "$file" >&2
+    exit 5
+  fi
+}
+
+check_client_identity() {
+  local resolved_bin expected_version expected_sha expected_team
+  local actual_version actual_sha signature team
+
+  resolved_bin="$(resolve_path "$CC_BIN")"
+  expected_version="$(jq -r '.client_version // empty' "$CONFIG_FILE")"
+  expected_sha="$(jq -r '.client_sha256 // empty' "$CONFIG_FILE")"
+  expected_team="$(jq -r '.client_macos_team_id // empty' "$CONFIG_FILE")"
+
+  if [ -z "$expected_version" ] || [ -z "$expected_sha" ]; then
+    printf 'CC 通道必须固定 client_version 和 client_sha256。\n' >&2
+    exit 12
+  fi
+
+  actual_version="$(
+    env -i \
+      HOME="$HOME" \
+      PATH="$PATH" \
+      TERM="${TERM:-xterm-256color}" \
+      LANG="${LANG:-en_US.UTF-8}" \
+      DISABLE_UPDATES=1 \
+      "$resolved_bin" --version 2>/dev/null |
+      awk 'NR == 1 {print $1}'
+  )"
+  if [ "$actual_version" != "$expected_version" ]; then
+    printf '客户端版本校验失败：期望 %s，实际 %s。\n' \
+      "$expected_version" "${actual_version:-unknown}" >&2
+    exit 12
+  fi
+
+  actual_sha="$(sha256_file "$resolved_bin")"
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    printf '客户端 SHA-256 校验失败：%s\n' "$resolved_bin" >&2
+    exit 12
+  fi
+
+  if [ -n "$expected_team" ]; then
+    if [ "$(uname -s)" != "Darwin" ] || ! command -v codesign >/dev/null 2>&1; then
+      printf '客户端签名校验失败：当前平台无法验证配置的 macOS Team ID。\n' >&2
+      exit 12
+    fi
+    if ! codesign --verify --strict "$resolved_bin" >/dev/null 2>&1; then
+      printf '客户端签名校验失败：codesign 未通过: %s\n' "$resolved_bin" >&2
+      exit 12
+    fi
+    signature="$(codesign -dv --verbose=4 "$resolved_bin" 2>&1 || true)"
+    team="$(printf '%s\n' "$signature" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+    if [ "$team" != "$expected_team" ]; then
+      printf '客户端签名校验失败：期望 Team ID %s，实际 %s。\n' \
+        "$expected_team" "${team:-unknown}" >&2
+      exit 12
+    fi
+  else
+    team="unpinned"
+  fi
+
+  printf 'CC 客户端身份校验通过：version=%s sha256=%s team=%s\n' \
+    "$actual_version" "${actual_sha:0:12}" "$team"
+}
+
+settings_risk_paths() {
+  local file="$1"
+
+  jq -r --arg re "$ROUTE_RISK_RE" '
+    paths(scalars) as $p
+    | ($p | map(tostring) | join(".")) as $path
+    | select($path | test($re; "i"))
+    | $path
+  ' "$file" | sort -u
+}
+
+project_settings_files() {
+  local dir="$PWD"
+  local file
+
+  while [ -n "$dir" ] && [ "$dir" != "$HOME" ]; do
+    for file in "$dir/.claude/settings.json" "$dir/.claude/settings.local.json"; do
+      [ -f "$file" ] && printf '%s\n' "$file"
+    done
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+}
+
+check_project_route_policy() {
+  local file risk_paths
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    validate_json_file "$file" "项目设置"
+    risk_paths="$(settings_risk_paths "$file")"
+    if [ -n "$risk_paths" ]; then
+      printf '项目设置试图改写 CC Switch 路由或凭据，已拒绝启动: %s\n' "$file" >&2
+      printf '%s\n' "$risk_paths" | sed 's/^/  - /' >&2
+      exit 13
+    fi
+  done <<EOF
+$(project_settings_files)
+EOF
+}
+
+check_cli_policy() {
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --settings|--settings=*)
+        printf 'CC 通道不允许覆盖 --settings；请修改固定的 CC Switch profile。\n' >&2
+        exit 13
+        ;;
+      --setting-sources|--setting-sources=*)
+        printf 'CC 通道不允许覆盖 --setting-sources。\n' >&2
+        exit 13
+        ;;
+    esac
+  done
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  printf 'CC 通道配置不存在: %s\n' "$CONFIG_FILE" >&2
+  exit 2
+fi
+validate_json_file "$CONFIG_FILE" "CC 通道配置"
+
+CC_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
+CC_CONFIG_DIR="$(jq -r '.config_dir // empty' "$CONFIG_FILE")"
+EXPECTED_BASE_URL="$(jq -r '.expected_base_url // empty' "$CONFIG_FILE")"
+REQUIRE_PROXY_TOKEN="$(jq -r '.require_proxy_managed_token // true' "$CONFIG_FILE")"
+REQUIRE_NO_CREDENTIALS="$(jq -r '.require_no_credentials // true' "$CONFIG_FILE")"
+CHECK_ENDPOINT="$(jq -r '.check_endpoint // true' "$CONFIG_FILE")"
+
+[ -n "$CC_CONFIG_DIR" ] || CC_CONFIG_DIR="$HOME/.claude"
+CC_SETTINGS="$CC_CONFIG_DIR/settings.json"
+
+case "$CC_BIN" in
+  /*) ;;
+  *)
+    printf '配置中的 command 必须是 Claude CLI 的绝对路径。\n' >&2
+    exit 2
+    ;;
+esac
+case "$CC_CONFIG_DIR" in
+  /*) ;;
+  *)
+    printf '配置中的 config_dir 必须是绝对路径: %s\n' "$CC_CONFIG_DIR" >&2
+    exit 2
+    ;;
+esac
+if [ ! -x "$CC_BIN" ]; then
+  printf '配置中的 command 不存在或不可执行: %s\n' "$CC_BIN" >&2
+  exit 2
+fi
+if [ "$(resolve_path "$CC_BIN")" = "$(resolve_path "$0")" ]; then
+  printf '配置中的 command 指向 claude-cc launcher 自己，会造成递归调用。\n' >&2
+  exit 2
+fi
+if [ ! -f "$CC_SETTINGS" ]; then
+  printf 'CC Switch settings 不存在: %s\n' "$CC_SETTINGS" >&2
+  exit 2
+fi
+validate_json_file "$CC_SETTINGS" "CC Switch settings"
+
+if [ -z "$EXPECTED_BASE_URL" ]; then
+  printf '配置中的 expected_base_url 不能为空。\n' >&2
+  exit 5
+fi
+if ! printf '%s\n' "$EXPECTED_BASE_URL" |
+  grep -Eq '^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?(/|$)'; then
+  printf 'CC Switch base URL 必须是本机 loopback 端点: %s\n' "$EXPECTED_BASE_URL" >&2
+  exit 5
+fi
+
+ACTUAL_BASE_URL="$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$CC_SETTINGS")"
+if [ "$ACTUAL_BASE_URL" != "$EXPECTED_BASE_URL" ]; then
+  printf 'CC Switch base URL 不匹配：期望 %s，实际 %s。\n' \
+    "$EXPECTED_BASE_URL" "${ACTUAL_BASE_URL:-missing}" >&2
+  exit 5
+fi
+if [ "$REQUIRE_PROXY_TOKEN" = "true" ] &&
+  ! jq -e '.env.ANTHROPIC_AUTH_TOKEN == "PROXY_MANAGED"' "$CC_SETTINGS" >/dev/null; then
+  printf 'CC Switch profile 未使用 PROXY_MANAGED token 模式，已拒绝启动。\n' >&2
+  exit 5
+fi
+
+if [ "$REQUIRE_NO_CREDENTIALS" = "true" ] &&
+  [ -s "$CC_CONFIG_DIR/.credentials.json" ]; then
+  printf 'CC Switch profile 存在官方 OAuth/API 凭据污染，已拒绝启动: %s\n' \
+    "$CC_CONFIG_DIR/.credentials.json" >&2
+  exit 5
+fi
+
+check_cli_policy "$@"
+check_project_route_policy
+check_client_identity
+
+if [ "$CHECK_ENDPOINT" = "true" ] &&
+  ! curl -sS -o /dev/null --connect-timeout 2 --max-time 5 "${EXPECTED_BASE_URL%/}/"; then
+  printf '本机 CC Switch 端点不可达，已拒绝启动: %s\n' "$EXPECTED_BASE_URL" >&2
+  exit 7
+fi
+
+printf 'CC Switch 通道预检通过：profile=%s endpoint=%s\n' \
+  "$CC_CONFIG_DIR" "$EXPECTED_BASE_URL"
+
+if [ "$PRECHECK_ONLY" = "1" ]; then
+  printf '预检完成：未启动 Claude Code。\n'
+  exit 0
+fi
+
+NO_PROXY_VALUE="127.0.0.1,localhost,::1,.local"
+if [ -n "${NO_PROXY:-}" ]; then
+  NO_PROXY_VALUE="${NO_PROXY_VALUE},${NO_PROXY}"
+fi
+
+exec env \
+  -u SAFE_CLAUDE_CONFIG \
+  -u CLAUDE_GUARD_CONFIG \
+  -u CLAUDE_GUARD_SETTINGS \
+  -u CLAUDE_CONFIG_DIR \
+  -u ANTHROPIC_BASE_URL \
+  -u ANTHROPIC_AUTH_TOKEN \
+  -u ANTHROPIC_API_KEY \
+  -u ANTHROPIC_CUSTOM_HEADERS \
+  -u ANTHROPIC_BEDROCK_BASE_URL \
+  -u ANTHROPIC_VERTEX_BASE_URL \
+  -u ANTHROPIC_FOUNDRY_BASE_URL \
+  -u CLAUDE_CODE_USE_GATEWAY \
+  -u CLAUDE_CODE_USE_BEDROCK \
+  -u CLAUDE_CODE_USE_VERTEX \
+  -u CLAUDE_CODE_USE_FOUNDRY \
+  -u CLAUDE_CODE_DISABLE_AGENT_VIEW \
+  -u CLAUDE_CODE_DISABLE_BACKGROUND_TASKS \
+  -u CLAUDE_CODE_DISABLE_CRON \
+  -u CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF \
+  -u CLAUDE_DISABLE_ADOPT \
+  -u CLAUDE_CODE_DISABLE_WORKFLOWS \
+  -u CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS \
+  -u CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH \
+  -u CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS \
+  -u CLAUDE_CODE_RETRY_WATCHDOG \
+  -u CLAUDE_CODE_PROCESS_WRAPPER \
+  -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC \
+  -u DISABLE_TELEMETRY \
+  -u CLAUDE_CODE_ENABLE_TELEMETRY \
+  -u CLAUDE_CODE_OTEL_HEADERS_HELPER \
+  -u OTEL_EXPORTER_OTLP_ENDPOINT \
+  -u OTEL_EXPORTER_OTLP_HEADERS \
+  -u OTEL_METRICS_EXPORTER \
+  -u OTEL_LOGS_EXPORTER \
+  -u OTEL_TRACES_EXPORTER \
+  CLAUDE_CONFIG_DIR="$CC_CONFIG_DIR" \
+  DISABLE_UPDATES=1 \
+  DISABLE_TELEMETRY=1 \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  NO_PROXY="$NO_PROXY_VALUE" \
+  no_proxy="$NO_PROXY_VALUE" \
+  "$CC_BIN" "$@"

@@ -6,8 +6,10 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 bash -n "$ROOT_DIR/bin/claude-guard"
+bash -n "$ROOT_DIR/bin/claude-cc"
 bash -n "$ROOT_DIR/scripts/install.sh"
 bash -n "$ROOT_DIR/scripts/install-entrypoint-shims.sh"
+bash -n "$ROOT_DIR/scripts/install-cc-entrypoint.sh"
 
 expected_version="$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")"
 version="$("$ROOT_DIR/bin/claude-guard" --version)"
@@ -22,6 +24,10 @@ CLAUDE_GUARD_PREFIX="$TMP_DIR/prefix" "$ROOT_DIR/scripts/install-entrypoint-shim
 grep -q '入口已收敛' /tmp/claude-guard-install.out
 grep -q 'exec "'$TMP_DIR'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude"
 grep -q 'exec "'$TMP_DIR'/prefix/bin/claude-guard" "$@"' "$TMP_DIR/prefix/bin/claude-official"
+
+CLAUDE_GUARD_PREFIX="$TMP_DIR/cc-prefix" "$ROOT_DIR/scripts/install-cc-entrypoint.sh" >/tmp/claude-cc-install.out 2>&1
+grep -q 'CC Switch 入口' /tmp/claude-cc-install.out
+cmp "$ROOT_DIR/bin/claude-cc" "$TMP_DIR/cc-prefix/bin/claude-cc"
 
 if CLAUDE_GUARD_CONFIG="$TMP_DIR/missing.json" "$ROOT_DIR/bin/claude-guard" >/tmp/claude-guard-test.out 2>&1; then
   printf 'missing config test unexpectedly passed\n' >&2

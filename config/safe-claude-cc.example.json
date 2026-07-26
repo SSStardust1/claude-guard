@@ -1,0 +1,11 @@
+{
+  "command": "/absolute/path/to/reviewed/claude",
+  "config_dir": "/Users/your-name/.claude",
+  "expected_base_url": "http://127.0.0.1:15721",
+  "client_version": "2.1.220",
+  "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
+  "client_macos_team_id": "Q6L2SF6YDW",
+  "require_proxy_managed_token": true,
+  "require_no_credentials": true,
+  "check_endpoint": true
+}

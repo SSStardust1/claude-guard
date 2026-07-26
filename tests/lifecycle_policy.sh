@@ -173,6 +173,19 @@ if PATH="$TMP_DIR/bin:$PATH" \
 fi
 grep -q 'codex@openai-codex' "$TMP_DIR/blocked-plugin.out"
 
+jq '.blocked_models = ["legacy-model-alias"]' \
+  "$TMP_DIR/config.json" >"$TMP_DIR/config-blocked-model.json"
+if PATH="$TMP_DIR/bin:$PATH" \
+  CLAUDE_GUARD_CONFIG="$TMP_DIR/config-blocked-model.json" \
+  CLAUDE_GUARD_SETTINGS="$TMP_DIR/settings-safe.json" \
+  CLAUDE_GUARD_CA_CERT="$TMP_DIR/cert.pem" \
+  "$ROOT_DIR/bin/claude-guard" --model legacy-model-alias \
+  >"$TMP_DIR/blocked-model.out" 2>&1; then
+  printf 'blocked model unexpectedly passed\n' >&2
+  exit 1
+fi
+grep -q 'blocked_models' "$TMP_DIR/blocked-model.out"
+
 printf '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:15721"}}\n' \
   >"$TMP_DIR/project/.claude/settings.json"
 if (
@@ -198,7 +211,8 @@ if run_guard --bg test >"$TMP_DIR/cli-background.out" 2>&1; then
 fi
 grep -q '后台会话已禁用' "$TMP_DIR/cli-background.out"
 
-run_guard --fake-run >"$TMP_DIR/launch.out" 2>&1
+run_guard --model future-model --fake-run >"$TMP_DIR/launch.out" 2>&1
+grep -qx 'future-model' "$TMP_DIR/fake-claude.args"
 for expected in \
   'CLAUDE_CODE_DISABLE_AGENT_VIEW=1' \
   'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1' \

@@ -8,5 +8,6 @@
   ],
   "blocked_plugins": [
     "codex@openai-codex"
-  ]
+  ],
+  "blocked_models": []
 }
