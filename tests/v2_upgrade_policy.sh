@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-mkdir -p "$TMP_DIR/bin" "$TMP_DIR/profile-v1" "$TMP_DIR/profile-v2"
-printf 'old-session-sentinel\n' >"$TMP_DIR/profile-v1/history.jsonl"
+mkdir -p "$TMP_DIR/bin" "$TMP_DIR/profile-stable/projects/sample"
+printf 'old-session-sentinel\n' >"$TMP_DIR/profile-stable/projects/sample/session.jsonl"
 
 cat >"$TMP_DIR/fake-claude" <<'EOF'
 #!/usr/bin/env bash
@@ -58,8 +58,9 @@ exit 1
 EOF
 chmod +x "$TMP_DIR/bin/curl"
 
-cat >"$TMP_DIR/profile-v2/settings.json" <<'EOF'
+cat >"$TMP_DIR/profile-stable/settings.json" <<'EOF'
 {
+  "model": "fable",
   "disableAgentView": true,
   "disableRemoteControl": true,
   "disableDeepLinkRegistration": "disable",
@@ -90,11 +91,11 @@ fi
 cat >"$TMP_DIR/config.json" <<EOF
 {
   "command": "$TMP_DIR/fake-claude",
-  "config_dir": "$TMP_DIR/profile-v2",
+  "config_dir": "$TMP_DIR/profile-stable",
   "allowed_ips": ["203.0.113.10"],
   "client_version": "2.1.220",
   "client_sha256": "$client_sha",
-  "require_unpinned_model": true
+  "require_unpinned_model": false
 }
 EOF
 
@@ -108,22 +109,22 @@ run_guard() {
 }
 
 run_guard --fake-run >"$TMP_DIR/launch.out" 2>&1
-grep -qx "CLAUDE_CONFIG_DIR=$TMP_DIR/profile-v2" "$TMP_DIR/fake-claude.env"
+grep -qx "CLAUDE_CONFIG_DIR=$TMP_DIR/profile-stable" "$TMP_DIR/fake-claude.env"
 grep -qx -- '--settings' "$TMP_DIR/fake-claude.args"
-grep -qx "$TMP_DIR/profile-v2/settings.json" "$TMP_DIR/fake-claude.args"
-grep -qx 'old-session-sentinel' "$TMP_DIR/profile-v1/history.jsonl"
+grep -qx "$TMP_DIR/profile-stable/settings.json" "$TMP_DIR/fake-claude.args"
+grep -qx 'old-session-sentinel' "$TMP_DIR/profile-stable/projects/sample/session.jsonl"
 
-jq '.model = "fable"' "$TMP_DIR/profile-v2/settings.json" \
-  >"$TMP_DIR/profile-v2/settings.pinned.json"
-mv "$TMP_DIR/profile-v2/settings.pinned.json" "$TMP_DIR/profile-v2/settings.json"
+jq '.require_unpinned_model = true' "$TMP_DIR/config.json" \
+  >"$TMP_DIR/config.unpinned.json"
+mv "$TMP_DIR/config.unpinned.json" "$TMP_DIR/config.json"
 if run_guard --precheck-only >"$TMP_DIR/pinned-model.out" 2>&1; then
-  printf 'pinned model unexpectedly passed\n' >&2
+  printf 'opt-in unpinned-model policy unexpectedly passed\n' >&2
   exit 1
 fi
 grep -q '固定 model' "$TMP_DIR/pinned-model.out"
-jq 'del(.model)' "$TMP_DIR/profile-v2/settings.json" \
-  >"$TMP_DIR/profile-v2/settings.unpinned.json"
-mv "$TMP_DIR/profile-v2/settings.unpinned.json" "$TMP_DIR/profile-v2/settings.json"
+jq '.require_unpinned_model = false' "$TMP_DIR/config.json" \
+  >"$TMP_DIR/config.continuity.json"
+mv "$TMP_DIR/config.continuity.json" "$TMP_DIR/config.json"
 
 rm -f "$TMP_DIR/fake-claude.started"
 jq '.allowed_ips = ["198.51.100.20"]' "$TMP_DIR/config.json" \
@@ -140,4 +141,4 @@ if [ -e "$TMP_DIR/fake-claude.started" ]; then
   exit 1
 fi
 
-printf 'v2 upgrade policy ok\n'
+printf 'v2 continuity policy ok\n'

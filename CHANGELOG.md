@@ -2,6 +2,17 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 2.0.1 - 2026-07-27
+
+- 修正 `v2.0.0` 过度保守的 profile 隔离默认值。
+- 官方通道默认沿用既有稳定 profile、settings、登录状态和 session，仅替换经过
+  验包的 Claude Code 客户端。
+- `require_unpinned_model` 在示例配置中改为 `false`，避免客户端升级同时改变
+  已经稳定使用的模型偏好。
+- 版本化空 profile 仍可用于独立排障，但不再作为正常升级要求。
+- 明确 session resume 是 Claude Code 的正常本地功能，不将新建空 session
+  描述为账号安全措施。
+
 ## 2.0.0 - 2026-07-26
 
 - 官方通道新增版本化 `config_dir`，让新内核不自动继承旧 session、history、

@@ -7,7 +7,7 @@ Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
 Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`2.0.0`
+当前版本：`2.0.1`
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
@@ -15,13 +15,13 @@ Claude Code 工程能力。两条通道共享客户端形态，但不共享 prof
 
 | 入口 | 用途 | Profile | 请求目标 | 客户端策略 | 生命周期策略 |
 | --- | --- | --- | --- | --- | --- |
-| `claude` / `claude-official` | 官方 Claude 模型 | 按大版本隔离的官方 profile | `api.anthropic.com` | 固定经过验包的版本 | 前台 fail-closed |
+| `claude` / `claude-official` | 官方 Claude 模型 | 显式固定的稳定官方 profile | `api.anthropic.com` | 固定经过验包的版本 | 前台 fail-closed |
 | `claude-cc` | 本机 CC Switch 兼容链路 | 独立 CC Switch profile | 固定 loopback endpoint | 独立跟进经过验包的新版本 | 保留工程能力 |
 
 核心边界：
 
-- 官方通道不读取 CC Switch 的 base URL、token 或 history；`v2.0.0` 使用新的
-  profile，避免直接恢复旧内核会话。
+- 官方通道不读取 CC Switch 的 base URL 或 token；`v2.0.1` 默认沿用原稳定
+  profile、settings 和 session，只替换经过验包的客户端内核。
 - CC Switch 通道不加载官方 profile 或文件凭据。macOS Keychain 是系统级边界，
   因此最终以实际 endpoint 和进程身份验证为准，不把“文件不存在”当作唯一证明。
 - 官方通道继续检查出口 IP、HTTP CONNECT、TLS issuer、IPv6 和生命周期策略。
@@ -40,8 +40,7 @@ Claude Code 工程能力。两条通道共享客户端形态，但不共享 prof
 是 `2.1.220`。这只是本次发布的验证矩阵，不代表仓库永远把某个版本写死为
 “最新”。
 
-`v2.0.0` 不会中断已经运行的旧进程。新 profile、客户端和门禁只在下一次执行
-`claude` 时生效。
+客户端切换不会中断已经运行的旧进程，只在下一次执行 `claude` 时生效。
 
 ## 为什么必须保留 2.1.170
 
@@ -112,6 +111,22 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
 
 ## 版本历史
+
+### 2.0.1 - Session 连续性修正
+
+`2.0.1` 将稳定官方 profile 和既有 session 视为升级基线。升级客户端不再默认
+切换到空 profile；官方的 `--continue`、`--resume` 和 `/resume` 行为保持可用。
+
+主要更新：
+
+- 示例配置默认继续使用既有 `~/.claude-official`。
+- 旧 settings、登录状态、项目历史和 session 保持原位，不复制、不迁移。
+- `require_unpinned_model` 默认关闭，避免升级同时改变用户已经稳定使用的模型设置。
+- 版本化空 profile 保留为可选排障方式，不作为日常升级要求。
+- 新内核仍需通过版本、SHA-256、签章、IP、TLS、IPv6 和生命周期门禁。
+
+详细说明见
+[`docs/v2.0.1-session-continuity.md`](docs/v2.0.1-session-continuity.md)。
 
 ### 2.0.0 - 最新内核的稳定灰度
 
@@ -381,7 +396,7 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 ```json
 {
   "command": "/usr/local/bin/claude",
-  "config_dir": "/Users/your-name/.claude-official-v2",
+  "config_dir": "/Users/your-name/.claude-official",
   "allowed_ips": ["203.0.113.10"],
   "allowed_cidrs": ["203.0.113.0/24"],
   "client_version": "2.1.220",
@@ -389,7 +404,7 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
   "client_macos_team_id": "Q6L2SF6YDW",
   "blocked_plugins": ["codex@openai-codex"],
   "blocked_models": [],
-  "require_unpinned_model": true
+  "require_unpinned_model": false
 }
 ```
 
@@ -400,8 +415,9 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 `blocked_models` 只用于阻止你明确知道不能进入官方通道的本地 alias。保持空数组
 时，Guard 不猜测模型是否存在；模型选择器和服务端负责最终校验。
 
-`require_unpinned_model=true` 时，profile 的 `settings.json` 不能存在固定
-`model`；如需单次指定模型，使用 `claude --model <name>`。
+`require_unpinned_model` 默认建议为 `false`，让客户端升级只更换内核，不同时
+改动已经稳定使用的模型设置。需要专门测试新版默认模型选择时才设为 `true`；
+如需单次指定模型，使用 `claude --model <name>`。
 
 官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
 
@@ -474,7 +490,7 @@ claude-cc --launcher-version
 
 ```bash
 CLAUDE_GUARD_CONFIG=~/.safe-claude-official.json
-CLAUDE_GUARD_SETTINGS=~/.claude-official-v2/settings.json
+CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
 CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
 CLAUDE_GUARD_IP_CHECK_URLS="https://ipinfo.io/ip https://api.ipify.org"
 CLAUDE_GUARD_ASSUME_YES=1
