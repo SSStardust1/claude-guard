@@ -5,13 +5,13 @@
 
 Claude 守护是一个给官方 Claude Code CLI 使用的启动前门禁。它把我们本地已经验证过的官方链路检查沉淀成可复用脚本，避免在代理未开启、出口 IP 漂移、TLS 被中间人改写、IPv6 意外泄漏、或官方配置被旧 CC Switch/base URL 污染时启动 Claude Code。
 
-当前版本：`0.2.3`
+当前版本：`0.2.4`
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
 ## 这个版本做什么
 
-`v0.2.3` 包含启动前门禁、客户端指纹 tripwire、入口收敛脚本和运行中 dry-run guardian。启动 Claude Code 前会检查：
+`v0.2.4` 包含启动前门禁、客户端指纹 tripwire、入口收敛脚本、生命周期 fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检查：
 
 - 当前出口 IP 是否在 `allowed_ips` 或 `allowed_cidrs` 白名单中。
 - Claude 官方 API 是否通过指定代理的 HTTP CONNECT 隧道访问。
@@ -20,6 +20,11 @@ Claude 守护是一个给官方 Claude Code CLI 使用的启动前门禁。它�
 - 官方 profile 的 `settings.json` 是否包含 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`apiKeyHelper`、`127.0.0.1:15721`、`PROXY_MANAGED` 等高风险残留。
 - 原始 Claude Code 客户端是否存在异常的 date/time 相关注入逻辑；如同时存在 `ANTHROPIC_BASE_URL` 或高风险时区等激活条件，则拒绝启动。
 - 模型参数中是否误写了不存在或不安全的模型别名。
+- 客户端版本、SHA-256，以及 macOS 上可选的 Anthropic Team ID 是否与安全配置一致。
+- 官方 settings 是否明确关闭 background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link registration 和自动更新。
+- 当前项目的 `.claude/settings.json` / `.claude/settings.local.json` 是否试图覆盖官方路由、证书、凭据、重试或生命周期策略。
+- 命令行是否试图通过 `--settings`、`--setting-sources`、`--bg`、`agents` 或 `remote-control` 绕过守门。
+- `blocked_plugins` 中列出的、已知会使用 detached process 的插件是否被启用。
 
 启动后会默认启动 dry-run guardian：
 
@@ -40,10 +45,40 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 - `ANTHROPIC_BASE_URL` 改写。
 - OAuth token 提取或转交第三方客户端。
 - timezone、locale、设备指纹伪装。
+- 风控标记清洗、归因字段移除或封禁规避。
 
-请只在符合服务条款和本地法规的场景中使用。
+请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
 
 ## 版本历史
+
+### 0.2.4 - 前台生命周期 Fail-Closed
+
+`0.2.4` 解决终端退出后 Claude 或其扩展仍可能继续运行的问题。默认策略是在官方 `processWrapper` 方案完成独立验证前，只允许受守护的前台会话。
+
+主要更新：
+
+- 关闭 background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link registration、hooks 和自动更新。
+- 拒绝 `--bg`、`--background`、`claude agents`、`--tmux`、Remote Control，以及额外 `--settings` / `--setting-sources` 覆盖。
+- 扫描当前项目的 settings，阻止 base URL、凭据、代理、CA、provider、retry watchdog 或生命周期降级配置。
+- 支持固定客户端版本、SHA-256 和 macOS Team ID，更新必须先验包再切换。
+- 支持 `blocked_plugins`；已知使用 detached process 的插件可以在启动前被拒绝。
+- 阻止 `CLAUDE_CODE_RETRY_WATCHDOG`，关闭 MCP 自动后台化，并限制子代理嵌套深度和并发数。
+- 新增真实 PTY close 验收，确认终端断开后没有 Claude supervisor、worker 或同进程组 sidecar 残留。
+- 风险报告只输出设置键路径，不回显可能包含 token 的配置行。
+
+边界说明：
+
+- 继续使用官方 Claude Code、官方 OAuth 和 `api.anthropic.com`；网络层仍是端到端 TLS 的 HTTP CONNECT。
+- 不修改请求正文、客户端归因、timezone、locale 或设备指纹。
+- 不提供封禁规避能力，也不承诺账号不会受到平台限制。
+- `watchdog` 仍为 dry-run；本版本通过关闭可脱离终端的入口来收敛风险，不实现不可靠的单 PID pause/kill。
+
+验证：
+
+- `./scripts/check.sh`
+- `python3 scripts/verify-terminal-exit.py`
+- 客户端版本、SHA-256 和 macOS Developer ID 签名核对。
+- 无模型 prompt 的官方 IP/TLS/IPv6 预检。
 
 ### 0.2.3 - 开源发布整理
 
@@ -212,7 +247,7 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 ~/.local/bin/claude-official
 ```
 
-两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀为 `.bak-before-claude-guard-v0.2.2`。
+两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v0.2.4`。
 
 `v0.2.2` 只负责入口收敛；`v0.2.1` 负责客户端指纹 tripwire。这样两个风险边界分开，后续回滚也更清楚。
 
@@ -232,11 +267,19 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 {
   "command": "/usr/local/bin/claude",
   "allowed_ips": ["203.0.113.10"],
-  "allowed_cidrs": ["203.0.113.0/24"]
+  "allowed_cidrs": ["203.0.113.0/24"],
+  "client_version": "2.1.220",
+  "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
+  "client_macos_team_id": "Q6L2SF6YDW",
+  "blocked_plugins": ["codex@openai-codex"]
 }
 ```
 
 `203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
+
+客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v0.2.4` 会把不匹配视为失败，不会静默运行新二进制。
+
+官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的模型、权限等其他设置。
 
 ## 使用
 
@@ -275,6 +318,23 @@ CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn
 CLAUDE_GUARD_LOG_FILE=~/.claude-guard/guard.log
 ```
 
+## 生命周期 Fail-Closed
+
+`v0.2.4` 默认要求：
+
+- `claude agents`、`--bg`、`/background` 和 on-demand supervisor 关闭。
+- Bash/subagent 后台任务、自动后台化和 `Ctrl+B` 关闭。
+- cron、dynamic workflows、Remote Control 和 deep-link registration 关闭。
+- MCP 长调用的自动后台化关闭。
+- 自动更新和手动自更新关闭，由维护者先验包后再更新固定版本。
+- `CLAUDE_CODE_RETRY_WATCHDOG` 必须不存在，避免无人值守时持续数小时重试。
+- 子代理嵌套深度为 `1`，同时运行上限为 `3`。
+- 所有 hooks 暂停，避免第三方 hook 在终端退出期间派生独立进程。
+
+这些设置来自 Claude Code 的公开配置接口，不改写请求、不伪装客户端，也不绕过保护措施。代价是不能使用后台 session、Remote Control、dynamic workflows 和 hooks；普通前台交互、内置工具与受限子代理仍可使用。
+
+当前官方 profile 中的 `codex@openai-codex` 插件包含 detached broker/background worker，因此建议列入 `blocked_plugins` 并在该 profile 中关闭。Codex App、Codex CLI 和 `claude-cc` 不受影响。
+
 ## 客户端指纹 Tripwire
 
 `v0.2.1` 新增客户端指纹预检。它不会转发、修改、清洗或拦截 Claude Code 请求，只做启动前风险判断。
@@ -302,11 +362,11 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 
 ## 当前边界
 
-`v0.2.2` 默认只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
+运行中 guardian 仍然只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
 
-这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v0.2.2` 会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
+这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v0.2.4` 会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
 
-真实 pause/resume 会放到下一版 process-group runner 中实现。
+在背景功能关闭的情况下，正常前台 Claude 随终端退出；真实 pause/resume 或官方 `processWrapper` 支持会作为独立版本评估。
 
 ## 验证
 
@@ -323,6 +383,21 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - 缺失配置失败路径。
 - `command` 非绝对路径失败路径。
 - 客户端指纹 tripwire active/strict 失败路径。
+- 生命周期必需设置失败路径。
+- `CLAUDE_CODE_RETRY_WATCHDOG` 拒绝路径。
+- 客户端版本和 SHA-256 不匹配失败路径。
+- 已知 detached 插件拒绝路径。
+- 项目级官方路由覆盖拒绝路径。
+- 命令行 settings/background 绕过拒绝路径。
 - IP 检查备用源 fallback。
 - `allowed_cidrs` 放行路径。
 - dry-run guardian 状态机。
+- 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
+
+版本切换后还应运行一次不发模型请求的实机 PTY 验收：
+
+```bash
+python3 scripts/verify-terminal-exit.py
+```
+
+它会启动 `--safe-mode` TUI、关闭伪终端并检查残留进程；不会提交 prompt。

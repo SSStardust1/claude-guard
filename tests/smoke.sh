@@ -39,7 +39,27 @@ grep -q '必须是原始 Claude CLI 的绝对路径' /tmp/claude-guard-test.out
 printf '#!/usr/bin/env bash\n# Asia/Shanghai\n# Asia/Urumqi\n# Today${n}s date is ${r}.\nprintf fake-claude\\n\n' > "$TMP_DIR/fingerprint-claude"
 chmod +x "$TMP_DIR/fingerprint-claude"
 printf '{"command":"%s","allowed_ips":["1.2.3.4"]}\n' "$TMP_DIR/fingerprint-claude" > "$TMP_DIR/fingerprint-config.json"
-printf '{}\n' > "$TMP_DIR/settings.json"
+cat >"$TMP_DIR/settings.json" <<'EOF'
+{
+  "disableAgentView": true,
+  "disableRemoteControl": true,
+  "disableDeepLinkRegistration": "disable",
+  "disableAllHooks": true,
+  "disableWorkflows": true,
+  "env": {
+    "DISABLE_UPDATES": "1",
+    "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_DISABLE_CRON": "1",
+    "CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF": "1",
+    "CLAUDE_DISABLE_ADOPT": "1",
+    "CLAUDE_CODE_DISABLE_WORKFLOWS": "1",
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3"
+  }
+}
+EOF
 printf 'fake ca\n' > "$TMP_DIR/cert.pem"
 
 if ANTHROPIC_BASE_URL="http://127.0.0.1:15721" \

@@ -2,10 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_VERSION="$(tr -d '[:space:]' <"$ROOT_DIR/VERSION")"
 PREFIX="${CLAUDE_GUARD_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 GUARD_TARGET="$BIN_DIR/claude-guard"
-BACKUP_SUFFIX="${CLAUDE_GUARD_BACKUP_SUFFIX:-bak-before-claude-guard-v0.2.2}"
+BACKUP_SUFFIX="${CLAUDE_GUARD_BACKUP_SUFFIX:-bak-before-claude-guard-v${PROJECT_VERSION}}"
 
 install_shim() {
   local name="$1"

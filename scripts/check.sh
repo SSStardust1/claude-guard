@@ -5,3 +5,4 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 "$ROOT_DIR/tests/smoke.sh"
 "$ROOT_DIR/tests/watchdog_state_machine.sh"
+"$ROOT_DIR/tests/lifecycle_policy.sh"

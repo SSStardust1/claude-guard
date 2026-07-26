@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.3"
+VERSION="0.2.4"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS="${CLAUDE_GUARD_SETTINGS:-$HOME/.claude-official/settings.json}"
@@ -28,6 +28,7 @@ NOTIFY_ENABLED="${CLAUDE_GUARD_NOTIFY:-0}"
 DRY_RUN_STDERR="${CLAUDE_GUARD_DRY_RUN_STDERR:-0}"
 FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
 LEGACY_PROFILE_MODE="${CLAUDE_GUARD_LEGACY_PROFILE_MODE:-warn}"
+SETTINGS_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|AWS_BASE_URL|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|PROXY_MANAGED|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|MANTLE)|CLAUDE_CODE_PROCESS_WRAPPER|processWrapper|CLAUDE_CODE_RETRY_WATCHDOG|CLAUDE_CODE_ATTRIBUTION_HEADER|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|CLAUDE_CODE_CERT_STORE|CLAUDE_CONFIG_DIR'
 PRECHECK_ONLY=0
 
 usage() {
@@ -56,6 +57,12 @@ Environment:
   CLAUDE_GUARD_LEGACY_PROFILE_MODE
                               off, warn, or strict for ~/.claude contamination. Default: warn.
   CLAUDE_GUARD_LOG_FILE      Default: ~/.claude-guard/guard.log
+
+Lifecycle policy:
+  Background agents, background tasks, cron, workflows, Remote Control,
+  deep-link registration, and automatic updates must be disabled in the
+  official settings file. Project settings and CLI flags cannot override
+  the guarded settings or official Anthropic route.
 
 The config file must contain:
   {
@@ -146,6 +153,247 @@ official_net_env() {
     SSL_CERT_FILE="$CA_CERT_FILE" \
     NODE_EXTRA_CA_CERTS="$CA_CERT_FILE" \
     "$@"
+}
+
+sha256_file() {
+  local file="$1"
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+    return 0
+  fi
+
+  printf '缺少 SHA-256 校验工具；需要 shasum 或 sha256sum。\n' >&2
+  return 1
+}
+
+check_client_identity() {
+  local claude_bin="$1"
+  local resolved_bin expected_version expected_sha expected_team
+  local actual_version actual_sha signature team
+
+  resolved_bin="$(resolve_path "$claude_bin")"
+  expected_version="$(jq -r '.client_version // empty' "$CONFIG_FILE")"
+  expected_sha="$(jq -r '.client_sha256 // empty' "$CONFIG_FILE")"
+  expected_team="$(jq -r '.client_macos_team_id // empty' "$CONFIG_FILE")"
+
+  if [ -n "$expected_version" ]; then
+    actual_version="$(clean_env DISABLE_UPDATES=1 "$resolved_bin" --version 2>/dev/null | awk 'NR == 1 {print $1}')"
+    if [ "$actual_version" != "$expected_version" ]; then
+      printf '客户端版本校验失败：期望 %s，实际 %s。\n' "$expected_version" "${actual_version:-unknown}" >&2
+      exit 12
+    fi
+  else
+    actual_version="unpinned"
+  fi
+
+  if [ -n "$expected_sha" ]; then
+    actual_sha="$(sha256_file "$resolved_bin")"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+      printf '客户端 SHA-256 校验失败：%s\n' "$resolved_bin" >&2
+      exit 12
+    fi
+  else
+    actual_sha="unpinned"
+  fi
+
+  if [ -n "$expected_team" ]; then
+    if [ "$(uname -s)" != "Darwin" ] || ! command -v codesign >/dev/null 2>&1; then
+      printf '客户端签名校验失败：配置要求 macOS Team ID，但当前平台无法使用 codesign。\n' >&2
+      exit 12
+    fi
+    if ! codesign --verify --strict "$resolved_bin" >/dev/null 2>&1; then
+      printf '客户端签名校验失败：codesign 未通过: %s\n' "$resolved_bin" >&2
+      exit 12
+    fi
+    signature="$(codesign -dv --verbose=4 "$resolved_bin" 2>&1 || true)"
+    team="$(printf '%s\n' "$signature" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+    if [ "$team" != "$expected_team" ]; then
+      printf '客户端签名校验失败：期望 Team ID %s，实际 %s。\n' "$expected_team" "${team:-unknown}" >&2
+      exit 12
+    fi
+  else
+    team="unpinned"
+  fi
+
+  printf '客户端身份校验通过：version=%s sha256=%s team=%s\n' \
+    "$actual_version" "${actual_sha:0:12}" "$team"
+}
+
+validate_json_file() {
+  local file="$1"
+  local label="$2"
+
+  if ! jq empty "$file" >/dev/null 2>&1; then
+    printf '%s 不是有效 JSON，已拒绝启动: %s\n' "$label" "$file" >&2
+    exit 5
+  fi
+}
+
+settings_risk_paths() {
+  local file="$1"
+
+  jq -r --arg re "$SETTINGS_RISK_RE" '
+    paths(scalars) as $p
+    | ($p | map(tostring) | join(".")) as $path
+    | (getpath($p) | tostring) as $value
+    | select(
+        ($path | test($re; "i"))
+        or ($value | test("127\\.0\\.0\\.1:15721|PROXY_MANAGED"; "i"))
+      )
+    | $path
+  ' "$file" | sort -u
+}
+
+check_blocked_plugins() {
+  local file="$1"
+  local label="$2"
+  local plugin
+
+  while IFS= read -r plugin; do
+    [ -n "$plugin" ] || continue
+    if jq -e --arg plugin "$plugin" '(.enabledPlugins // {})[$plugin] == true' "$file" >/dev/null; then
+      printf '%s 启用了会脱离终端运行的受阻插件，已拒绝启动: %s (%s)\n' \
+        "$label" "$plugin" "$file" >&2
+      exit 13
+    fi
+  done <<EOF
+$(jq -r '.blocked_plugins // [] | .[] | select(type == "string")' "$CONFIG_FILE")
+EOF
+}
+
+check_official_settings_policy() {
+  local missing risk_paths
+
+  validate_json_file "$OFFICIAL_SETTINGS" "官方 settings"
+
+  risk_paths="$(settings_risk_paths "$OFFICIAL_SETTINGS")"
+  if [ -n "$risk_paths" ]; then
+    printf '官方 settings 含有路由、凭据、证书或重试策略改写，已拒绝启动: %s\n' "$OFFICIAL_SETTINGS" >&2
+    printf '%s\n' "$risk_paths" | sed 's/^/  - /' >&2
+    exit 5
+  fi
+
+  missing="$(jq -r '
+    [
+      if .disableAgentView != true then "disableAgentView=true" else empty end,
+      if .disableRemoteControl != true then "disableRemoteControl=true" else empty end,
+      if .disableDeepLinkRegistration != "disable" then "disableDeepLinkRegistration=disable" else empty end,
+      if .disableAllHooks != true then "disableAllHooks=true" else empty end,
+      if .disableWorkflows != true then "disableWorkflows=true" else empty end,
+      if ((.env // {}).DISABLE_UPDATES != "1") then "env.DISABLE_UPDATES=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_DISABLE_AGENT_VIEW != "1") then "env.CLAUDE_CODE_DISABLE_AGENT_VIEW=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_DISABLE_BACKGROUND_TASKS != "1") then "env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_DISABLE_CRON != "1") then "env.CLAUDE_CODE_DISABLE_CRON=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF != "1") then "env.CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF=1" else empty end,
+      if ((.env // {}).CLAUDE_DISABLE_ADOPT != "1") then "env.CLAUDE_DISABLE_ADOPT=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_DISABLE_WORKFLOWS != "1") then "env.CLAUDE_CODE_DISABLE_WORKFLOWS=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS != "0") then "env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0" else empty end,
+      if ((.env // {}).CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH != "1") then "env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1" else empty end,
+      if ((.env // {}).CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS != "3") then "env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3" else empty end,
+      if (((.env // {}).CLAUDE_AUTO_BACKGROUND_TASKS // "") == "1") then "remove env.CLAUDE_AUTO_BACKGROUND_TASKS=1" else empty end,
+      if (((.env // {}).CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS // "") == "1") then "remove env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1" else empty end,
+      if (((.env // {}).CLAUDE_CODE_RETRY_WATCHDOG // "") != "") then "remove env.CLAUDE_CODE_RETRY_WATCHDOG" else empty end
+    ]
+    | .[]
+  ' "$OFFICIAL_SETTINGS")"
+
+  if [ -n "$missing" ]; then
+    printf '官方 settings 未满足 v%s 生命周期策略，已拒绝启动: %s\n' "$VERSION" "$OFFICIAL_SETTINGS" >&2
+    printf '%s\n' "$missing" | sed 's/^/  - /' >&2
+    exit 13
+  fi
+
+  check_blocked_plugins "$OFFICIAL_SETTINGS" "官方 settings"
+  printf '生命周期策略通过：后台会话、后台任务、排程、工作流、Remote Control 与自动更新均已关闭。\n'
+}
+
+project_settings_files() {
+  local dir="$PWD"
+  local file
+
+  while [ -n "$dir" ] && [ "$dir" != "$HOME" ]; do
+    for file in "$dir/.claude/settings.json" "$dir/.claude/settings.local.json"; do
+      [ -f "$file" ] && printf '%s\n' "$file"
+    done
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+}
+
+check_project_settings_policy() {
+  local file risk_paths unsafe
+
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    validate_json_file "$file" "项目设置"
+
+    risk_paths="$(settings_risk_paths "$file")"
+    if [ -n "$risk_paths" ]; then
+      printf '项目设置试图改写官方路由、凭据、证书或重试策略，已拒绝启动: %s\n' "$file" >&2
+      printf '%s\n' "$risk_paths" | sed 's/^/  - /' >&2
+      exit 13
+    fi
+
+    unsafe="$(jq -r '
+      [
+        if (.disableAgentView != null and .disableAgentView != true) then "disableAgentView" else empty end,
+        if (.disableRemoteControl != null and .disableRemoteControl != true) then "disableRemoteControl" else empty end,
+        if (.disableDeepLinkRegistration != null and .disableDeepLinkRegistration != "disable") then "disableDeepLinkRegistration" else empty end,
+        if (.disableAllHooks != null and .disableAllHooks != true) then "disableAllHooks" else empty end,
+        if (.disableWorkflows != null and .disableWorkflows != true) then "disableWorkflows" else empty end,
+        if (((.env // {}).CLAUDE_CODE_DISABLE_AGENT_VIEW // "1") != "1") then "env.CLAUDE_CODE_DISABLE_AGENT_VIEW" else empty end,
+        if (((.env // {}).CLAUDE_CODE_DISABLE_BACKGROUND_TASKS // "1") != "1") then "env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" else empty end,
+        if (((.env // {}).CLAUDE_CODE_DISABLE_CRON // "1") != "1") then "env.CLAUDE_CODE_DISABLE_CRON" else empty end,
+        if (((.env // {}).CLAUDE_CODE_DISABLE_WORKFLOWS // "1") != "1") then "env.CLAUDE_CODE_DISABLE_WORKFLOWS" else empty end,
+        if (((.env // {}).CLAUDE_AUTO_BACKGROUND_TASKS // "") == "1") then "env.CLAUDE_AUTO_BACKGROUND_TASKS" else empty end,
+        if (((.env // {}).CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS // "") == "1") then "env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" else empty end
+      ]
+      | .[]
+    ' "$file")"
+    if [ -n "$unsafe" ]; then
+      printf '项目设置试图降低生命周期保护，已拒绝启动: %s\n' "$file" >&2
+      printf '%s\n' "$unsafe" | sed 's/^/  - /' >&2
+      exit 13
+    fi
+
+    check_blocked_plugins "$file" "项目设置"
+  done <<EOF
+$(project_settings_files)
+EOF
+}
+
+check_cli_policy() {
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --settings|--settings=*)
+        printf '官方入口不允许覆盖 --settings；请修改受守护的官方 settings 文件。\n' >&2
+        exit 13
+        ;;
+      --setting-sources|--setting-sources=*)
+        printf '官方入口不允许覆盖 --setting-sources。\n' >&2
+        exit 13
+        ;;
+      --bg|--bg=*|--background|--background=*|agents|attach|respawn)
+        printf '后台会话已禁用；请在当前前台终端中运行 Claude。\n' >&2
+        exit 13
+        ;;
+      --tmux|--tmux=*)
+        printf '受守护入口不允许启动脱离当前终端的 tmux/iTerm2 会话。\n' >&2
+        exit 13
+        ;;
+      --remote-control|--remote-control=*|remote-control)
+        printf 'Remote Control 已禁用；官方 Claude 必须留在受守护的前台终端中。\n' >&2
+        exit 13
+        ;;
+    esac
+  done
 }
 
 check_tls_host() {
@@ -306,6 +554,7 @@ EOF
 check_legacy_profile_contamination() {
   local profile="$HOME/.claude/settings.json"
   local marker_re='ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED|CLAUDE_CODE_USE_GATEWAY'
+  local markers
 
   [ "$LEGACY_PROFILE_MODE" = "off" ] && return 0
   [ -f "$profile" ] || return 0
@@ -315,7 +564,8 @@ check_legacy_profile_contamination() {
 
   if [ "$LEGACY_PROFILE_MODE" = "strict" ]; then
     printf '旧默认 Claude profile 含有反代/凭据注入残留，strict 模式已拒绝启动: %s\n' "$profile" >&2
-    grep -Ein "$marker_re" "$profile" >&2 || true
+    markers="$(grep -Eio "$marker_re" "$profile" | sort -u || true)"
+    printf '%s\n' "$markers" | sed 's/^/  - /' >&2
     exit 11
   fi
 
@@ -649,6 +899,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   exit 2
 fi
 
+validate_json_file "$CONFIG_FILE" "IP 安全配置"
 CLAUDE_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
 if [ -z "$CLAUDE_BIN" ]; then
   printf '配置中的 command 不能为空。\n' >&2
@@ -680,12 +931,10 @@ if [ ! -f "$CA_CERT_FILE" ]; then
   exit 2
 fi
 
-if grep -Eiq 'ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED' "$OFFICIAL_SETTINGS"; then
-  printf '官方旁路 settings 含有疑似反代/凭据注入配置，已拒绝启动: %s\n' "$OFFICIAL_SETTINGS" >&2
-  grep -Ein 'ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|apiKeyHelper|127\.0\.0\.1:15721|PROXY_MANAGED' "$OFFICIAL_SETTINGS" >&2 || true
-  exit 5
-fi
-
+check_official_settings_policy
+check_project_settings_policy
+check_cli_policy "$@"
+check_client_identity "$CLAUDE_BIN"
 check_legacy_profile_contamination
 check_client_fingerprint_tripwire "$CLAUDE_BIN"
 
@@ -769,10 +1018,20 @@ exec env -i \
   CLAUDE_CONFIG_DIR="$HOME/.claude-official" \
   DISABLE_TELEMETRY="1" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" \
+  DISABLE_UPDATES="1" \
+  CLAUDE_CODE_DISABLE_AGENT_VIEW="1" \
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1" \
+  CLAUDE_CODE_DISABLE_CRON="1" \
+  CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF="1" \
+  CLAUDE_DISABLE_ADOPT="1" \
+  CLAUDE_CODE_DISABLE_WORKFLOWS="1" \
+  CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS="0" \
+  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="1" \
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS="3" \
   CLAUDE_CODE_CERT_STORE="system" \
   SSL_CERT_FILE="$CA_CERT_FILE" \
   NODE_EXTRA_CA_CERTS="$CA_CERT_FILE" \
   "$CLAUDE_BIN" \
-  --setting-sources= \
+  --setting-sources=user,project \
   --settings "$OFFICIAL_SETTINGS" \
   "$@"

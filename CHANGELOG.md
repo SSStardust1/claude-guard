@@ -2,6 +2,19 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 0.2.4 - 2026-07-26
+
+- 新增生命周期 fail-closed：要求关闭 background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link registration 和自动更新。
+- 拒绝 `--bg`、`claude agents`、Remote Control、额外 `--settings` 与 `--setting-sources` 覆盖。
+- 新增当前项目 settings 扫描，阻止项目级 base URL、凭据、代理、CA、provider 和 retry watchdog 注入。
+- 新增客户端 `client_version`、`client_sha256` 与 macOS `client_macos_team_id` 可选固定校验。
+- 新增 `blocked_plugins`，可拒绝已知会派生 detached process 的插件；本机官方 profile 将 `codex@openai-codex` 列入阻止清单。
+- 要求 `CLAUDE_CODE_RETRY_WATCHDOG` 不存在，避免无人值守时产生长时间自动重试。
+- 限制子代理嵌套深度和并发数，并关闭 MCP 自动后台化。
+- 风险设置报告只打印键路径，不再回显可能包含 token 的整行。
+- 新增生命周期策略、项目设置污染、CLI 绕过、客户端身份与前台退出 sidecar 清理测试。
+- 明确政策边界：不清洗指纹、不改写请求、不规避封禁，也不保证账号状态。
+
 ## 0.2.3 - 2026-07-01
 
 - 开源发布整理：新增 MIT License、Contributing、Security Policy 和 GitHub Actions 检查。
