@@ -2,6 +2,20 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 2.0.0 - 2026-07-26
+
+- 官方通道新增版本化 `config_dir`，让新内核不自动继承旧 session、history、
+  plugin cache 或 marketplace。
+- 取消未授权出口 IP 的 `unsafe` 绕过，错误网络环境始终 fail-closed。
+- 新增 `require_unpinned_model`，可拒绝 profile 中遗留的固定模型设置。
+- CC Switch 通道新增监听进程路径、macOS Team ID、Bundle ID、应用版本验证。
+- 将端点检查从根路径可达升级为可配置的 `/v1/messages` 协议探针。
+- `2.1.220` 作为验包候选内核，保存原始 npm tarball、npm integrity、签名元数据、
+  SHA-1、SHA-256 和 Developer ID；继续保留 `2.1.170` 回退基线。
+- 新增 `tests/v2_upgrade_policy.sh`，验证 profile 隔离、模型取消固定和 IP
+  fail-closed。
+- 日常入口仍为 `claude` / `claude-cc`；已经运行的旧进程不会被中断。
+
 ## 1.0.0 - 2026-07-26
 
 - 将项目从单一官方入口门禁升级为明确的双通道版本策略。

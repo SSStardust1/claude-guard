@@ -5,26 +5,29 @@
 
 Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方 Claude
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
-Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile、凭据和路由。
+Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`1.0.0`
+当前版本：`2.0.0`
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
-## v1.0 双通道架构
+## v2.0 稳定升级架构
 
 | 入口 | 用途 | Profile | 请求目标 | 客户端策略 | 生命周期策略 |
 | --- | --- | --- | --- | --- | --- |
-| `claude` / `claude-official` | 官方 Claude 模型 | 独立官方 profile | `api.anthropic.com` | 固定经过验包的版本 | 前台 fail-closed |
+| `claude` / `claude-official` | 官方 Claude 模型 | 按大版本隔离的官方 profile | `api.anthropic.com` | 固定经过验包的版本 | 前台 fail-closed |
 | `claude-cc` | 本机 CC Switch 兼容链路 | 独立 CC Switch profile | 固定 loopback endpoint | 独立跟进经过验包的新版本 | 保留工程能力 |
 
 核心边界：
 
-- 官方通道不读取 CC Switch 的 base URL、token 或 history。
-- CC Switch 通道不读取官方 OAuth/API credentials。
+- 官方通道不读取 CC Switch 的 base URL、token 或 history；`v2.0.0` 使用新的
+  profile，避免直接恢复旧内核会话。
+- CC Switch 通道不加载官方 profile 或文件凭据。macOS Keychain 是系统级边界，
+  因此最终以实际 endpoint 和进程身份验证为准，不把“文件不存在”当作唯一证明。
 - 官方通道继续检查出口 IP、HTTP CONNECT、TLS issuer、IPv6 和生命周期策略。
-- CC Switch 通道检查客户端身份、本机 endpoint、profile 路由和 credentials
-  污染；它不会把第三方兼容链路描述成 Anthropic 官方链路。
+- CC Switch 通道检查客户端身份、本机 endpoint、监听进程路径、签名、Bundle ID、
+  应用版本、profile 路由和 credentials 污染；它不会把第三方兼容链路描述成
+  Anthropic 官方链路。
 - 两条通道都关闭客户端自动更新。任何版本切换都必须先验版本、SHA-256、
   macOS 签章和回归测试，再修改固定指针。
 - CC Switch 通道有意保留 background agent、plugin、hook 等工程能力，因此它
@@ -33,9 +36,12 @@ Claude Code 工程能力。两条通道共享客户端形态，但不共享 prof
 - CC Switch 通道关闭 telemetry、OTel exporter、非必要网络流量和自动更新，
   但不关闭核心推理、工具、agent、plugin 或 hook。
 
-发布 `v1.0.0` 时，[Claude Code 最新版本](https://github.com/anthropics/claude-code/releases/tag/v2.1.220)
+发布 `v2.0.0` 时，[Claude Code 验证版本](https://github.com/anthropics/claude-code/releases/tag/v2.1.220)
 是 `2.1.220`。这只是本次发布的验证矩阵，不代表仓库永远把某个版本写死为
 “最新”。
+
+`v2.0.0` 不会中断已经运行的旧进程。新 profile、客户端和门禁只在下一次执行
+`claude` 时生效。
 
 ## 为什么必须保留 2.1.170
 
@@ -66,6 +72,7 @@ OAuth token。项目不提供封禁规避、token 转发或风控绕过能力。
 fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检查：
 
 - 当前出口 IP 是否在 `allowed_ips` 或 `allowed_cidrs` 白名单中。
+- 未授权出口直接 fail-closed；`v2.0.0` 不再提供 `unsafe` 绕过。
 - Claude 官方 API 是否通过指定代理的 HTTP CONNECT 隧道访问。
 - TLS 证书是否由正常公共 CA 签发，且未出现 Charles、mitmproxy、Fiddler、ZScaler 等中间人痕迹。
 - `api.anthropic.com` 是否无法通过公网 IPv6 直连，确保官方链路压在 IPv4；Mihomo/Clash fake-ip 的 `::ffff:198.18.x.x` 不会被误判为公网 IPv6。
@@ -73,6 +80,8 @@ fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检�
 - 原始 Claude Code 客户端是否存在异常的 date/time 相关注入逻辑；如同时存在 `ANTHROPIC_BASE_URL` 或高风险时区等激活条件，则拒绝启动。
 - 模型参数是否命中本机显式配置的 `blocked_models`；未列入的模型名称交由
   官方服务端判断，不在 Guard 中硬编码猜测。
+- 可选要求官方 settings 不固定 `model`，让客户端升级后使用新的模型选择结果；
+  单次模型选择仍可通过 `--model` 显式传入。
 - 客户端版本、SHA-256，以及 macOS 上可选的 Anthropic Team ID 是否与安全配置一致。
 - 官方 settings 是否明确关闭 background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link registration 和自动更新。
 - 当前项目的 `.claude/settings.json` / `.claude/settings.local.json` 是否试图覆盖官方路由、证书、凭据、重试或生命周期策略。
@@ -103,6 +112,27 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 请只在符合服务条款和本地法规的场景中使用。守门程序只能降低本机配置和进程生命周期风险，不能保证账号不会被限制，也不能把换号绕过封禁变成合规行为。
 
 ## 版本历史
+
+### 2.0.0 - 最新内核的稳定灰度
+
+`2.0.0` 在不改变日常命令的前提下，把最新内核升级从“修改一个二进制路径”
+提升为可回滚、可验包、可隔离会话的发布流程。
+
+主要更新：
+
+- 官方通道支持由安全配置指定版本化 `config_dir`；旧 history、session 和插件
+  不会自动进入新内核。
+- 删除未授权 IP 的 `unsafe` 交互绕过。
+- 可要求官方 settings 不固定模型，避免旧模型 pin 覆盖新版默认选择。
+- CC Switch 通道新增监听程序路径、Team ID、Bundle ID、应用版本和
+  `/v1/messages` 协议探针。
+- `2.1.220` 保存原始 npm 包、SHA-1、SHA-256、npm integrity、签名元数据和
+  macOS Developer ID；`2.1.170` 继续保留为历史回退基线。
+- 新增 `v2_upgrade_policy` 回归测试，验证新 profile、模型取消固定和 IP
+  fail-closed。
+
+详细行为与使用影响见
+[`docs/v2.0.0-staged-latest-kernel.md`](docs/v2.0.0-staged-latest-kernel.md)。
 
 ### 1.0.0 - 双通道版本策略
 
@@ -321,7 +351,7 @@ Claude 守护只做本地启动前检查和 dry-run 观察。它不做：
 ~/.local/bin/claude-official
 ```
 
-两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v1.0.0`。
+两个入口都会先进入 `~/.local/bin/claude-guard`。安装前会自动备份旧入口，默认备份后缀会跟随当前版本，例如 `.bak-before-claude-guard-v2.0.0`。
 
 `v0.2.2` 只负责入口收敛；`v0.2.1` 负责客户端指纹 tripwire。这样两个风险边界分开，后续回滚也更清楚。
 
@@ -351,24 +381,29 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 ```json
 {
   "command": "/usr/local/bin/claude",
+  "config_dir": "/Users/your-name/.claude-official-v2",
   "allowed_ips": ["203.0.113.10"],
   "allowed_cidrs": ["203.0.113.0/24"],
   "client_version": "2.1.220",
   "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
   "client_macos_team_id": "Q6L2SF6YDW",
   "blocked_plugins": ["codex@openai-codex"],
-  "blocked_models": []
+  "blocked_models": [],
+  "require_unpinned_model": true
 }
 ```
 
 `203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
 
-客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v1.0.0` 会把不匹配视为失败，不会静默运行新二进制。
+客户端身份字段是可选的，但安全入口建议全部填写。更新 Claude Code 时应先离线核对新版本、哈希和签名，再一起更新配置；`v2.0.0` 会把不匹配视为失败，不会静默运行新二进制。
 
 `blocked_models` 只用于阻止你明确知道不能进入官方通道的本地 alias。保持空数组
 时，Guard 不猜测模型是否存在；模型选择器和服务端负责最终校验。
 
-官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的模型、权限等其他设置。
+`require_unpinned_model=true` 时，profile 的 `settings.json` 不能存在固定
+`model`；如需单次指定模型，使用 `claude --model <name>`。
+
+官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
 
 ### CC Switch 通道
 
@@ -385,6 +420,8 @@ cp config/safe-claude-cc.example.json ~/.safe-claude-cc.json
 - `expected_base_url`：CC Switch 的本机 loopback endpoint。
 - `client_version`、`client_sha256`：当前批准使用的客户端身份。
 - macOS 建议同时固定 `client_macos_team_id=Q6L2SF6YDW`。
+- macOS 建议固定 CC Switch 的执行路径、Team ID、Bundle ID 和应用版本。
+- 使用无模型请求的 `OPTIONS /v1/messages` 协议探针，不只检查根路径能否返回。
 
 默认还会要求 `PROXY_MANAGED` token 模式、profile 中不存在
 `.credentials.json`，并检查本机 endpoint 可达。
@@ -437,7 +474,7 @@ claude-cc --launcher-version
 
 ```bash
 CLAUDE_GUARD_CONFIG=~/.safe-claude-official.json
-CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
+CLAUDE_GUARD_SETTINGS=~/.claude-official-v2/settings.json
 CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
 CLAUDE_GUARD_IP_CHECK_URLS="https://ipinfo.io/ip https://api.ipify.org"
 CLAUDE_GUARD_ASSUME_YES=1
@@ -490,13 +527,13 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - `fail-active`：默认值，只在激活条件存在时拒绝。
 - `strict`：只要客户端含有已知逻辑就拒绝。
 
-`CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn` 会检查 `~/.claude/settings.json` 的旧 CC Switch 残留并提示，但不会阻断官方入口，因为官方入口使用独立的 `~/.claude-official`。
+`CLAUDE_GUARD_LEGACY_PROFILE_MODE=warn` 会检查 `~/.claude/settings.json` 的旧 CC Switch 残留并提示，但不会阻断官方入口，因为官方入口使用配置指定的独立 profile。
 
 ## 当前边界
 
 运行中 guardian 仍然只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
 
-这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v1.0.0` 仍会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
+这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v2.0.0` 仍会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
 
 在背景功能关闭的情况下，正常前台 Claude 随终端退出；真实 pause/resume 或官方 `processWrapper` 支持会作为独立版本评估。
 
@@ -527,8 +564,10 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - 模拟前台 Claude 退出后 watchdog sidecar 在限定时间内退出。
 - CC Switch 客户端版本、SHA-256 与签章固定。
 - CC Switch loopback endpoint 和 `PROXY_MANAGED` profile 固定。
+- CC Switch 监听进程路径与协议探针拒绝路径。
 - CC profile 官方 credentials 污染拒绝路径。
 - CC 项目设置、CLI settings 与父进程环境污染拒绝路径。
+- 官方版本化 profile、模型取消固定和未授权 IP 不可绕过。
 
 版本切换后还应运行一次不发模型请求的实机 PTY 验收：
 

@@ -7,5 +7,12 @@
   "client_macos_team_id": "Q6L2SF6YDW",
   "require_proxy_managed_token": true,
   "require_no_credentials": true,
-  "check_endpoint": true
+  "check_endpoint": true,
+  "endpoint_probe_path": "/v1/messages",
+  "endpoint_probe_method": "OPTIONS",
+  "endpoint_expected_statuses": [405],
+  "endpoint_process_path": "/Applications/CC Switch.app/Contents/MacOS/cc-switch",
+  "endpoint_macos_team_id": "<replace-with-the-reviewed-team-id>",
+  "endpoint_macos_bundle_id": "<replace-with-the-reviewed-bundle-id>",
+  "endpoint_macos_version": "<replace-with-the-reviewed-app-version>"
 }

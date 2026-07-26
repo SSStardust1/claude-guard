@@ -46,7 +46,11 @@ def main() -> int:
     )
 
     with config_path.open(encoding="utf-8") as handle:
-        client = str(Path(json.load(handle)["command"]).resolve())
+        config = json.load(handle)
+        client = str(Path(config["command"]).resolve())
+        config_dir = str(
+            Path(config.get("config_dir", home / ".claude-official")).resolve()
+        )
 
     if not entry.is_file():
         raise SystemExit(f"guard entry does not exist: {entry}")
@@ -117,7 +121,7 @@ def main() -> int:
     ).stdout.splitlines()
     markers = (
         client,
-        ".claude-official/daemon",
+        f"{config_dir}/daemon",
         "claude bg-pty-host",
         "claude bg-spare",
     )

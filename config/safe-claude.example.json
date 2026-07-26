@@ -1,5 +1,6 @@
 {
   "command": "/absolute/path/to/original/claude",
+  "config_dir": "/Users/your-name/.claude-official-v2",
   "allowed_ips": [
     "203.0.113.10"
   ],
@@ -9,5 +10,6 @@
   "blocked_plugins": [
     "codex@openai-codex"
   ],
-  "blocked_models": []
+  "blocked_models": [],
+  "require_unpinned_model": true
 }

@@ -30,9 +30,31 @@ set -euo pipefail
 if [ "${FAKE_CURL_FAIL:-0}" = "1" ]; then
   exit 7
 fi
+if printf '%s\n' "$*" | grep -q '/v1/messages'; then
+  printf '%s' "${FAKE_CURL_STATUS:-405}"
+fi
 exit 0
 EOF
 chmod +x "$TMP_DIR/bin/curl"
+
+cat >"$TMP_DIR/bin/lsof" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+if printf '%s\n' "\$*" | grep -q -- '-iTCP:15721'; then
+  printf '4242\n'
+  exit 0
+fi
+if printf '%s\n' "\$*" | grep -q -- '-d txt'; then
+  printf 'p4242\nn%s\n' "\${FAKE_LISTENER_EXE:-$TMP_DIR/fake-cc-switch}"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$TMP_DIR/bin/lsof"
+
+printf '#!/usr/bin/env bash\nexit 0\n' >"$TMP_DIR/fake-cc-switch"
+chmod +x "$TMP_DIR/fake-cc-switch"
 
 cat >"$TMP_DIR/profile/settings.json" <<'EOF'
 {
@@ -58,7 +80,11 @@ cat >"$TMP_DIR/config.json" <<EOF
   "client_sha256": "$client_sha",
   "require_proxy_managed_token": true,
   "require_no_credentials": true,
-  "check_endpoint": true
+  "check_endpoint": true,
+  "endpoint_probe_path": "/v1/messages",
+  "endpoint_probe_method": "OPTIONS",
+  "endpoint_expected_statuses": [405],
+  "endpoint_process_path": "$TMP_DIR/fake-cc-switch"
 }
 EOF
 
@@ -157,5 +183,19 @@ if FAKE_CURL_FAIL=1 run_cc --precheck-only \
   exit 1
 fi
 grep -q '本机 CC Switch 端点不可达' "$TMP_DIR/endpoint.out"
+
+if FAKE_CURL_STATUS=200 run_cc --precheck-only \
+  >"$TMP_DIR/protocol.out" 2>&1; then
+  printf 'unexpected endpoint protocol status passed\n' >&2
+  exit 1
+fi
+grep -q '协议探针异常' "$TMP_DIR/protocol.out"
+
+if FAKE_LISTENER_EXE="$TMP_DIR/not-cc-switch" run_cc --precheck-only \
+  >"$TMP_DIR/listener.out" 2>&1; then
+  printf 'wrong listener identity unexpectedly passed\n' >&2
+  exit 1
+fi
+grep -q '监听进程身份不匹配' "$TMP_DIR/listener.out"
 
 printf 'cc lane policy ok\n'

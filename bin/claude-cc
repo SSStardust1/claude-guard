@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 CONFIG_FILE="${CLAUDE_CC_CONFIG:-$HOME/.safe-claude-cc.json}"
 PRECHECK_ONLY=0
 ROUTE_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|CLAUDE_CONFIG_DIR|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY)'
@@ -203,6 +203,124 @@ check_cli_policy() {
   done
 }
 
+endpoint_port() {
+  local port
+
+  port="$(printf '%s\n' "$EXPECTED_BASE_URL" |
+    sed -nE 's#^https?://(127\.0\.0\.1|localhost|\[::1\]):([0-9]+)(/.*)?$#\2#p')"
+  if [ -z "$port" ]; then
+    printf '无法从 CC Switch base URL 读取监听端口: %s\n' "$EXPECTED_BASE_URL" >&2
+    return 1
+  fi
+  printf '%s\n' "$port"
+}
+
+check_endpoint_process_identity() {
+  local expected_path expected_team expected_bundle expected_version
+  local port pids pid actual_path signature team app_root info_plist bundle version
+
+  expected_path="$(jq -r '.endpoint_process_path // empty' "$CONFIG_FILE")"
+  [ -n "$expected_path" ] || return 0
+  case "$expected_path" in
+    /*) ;;
+    *)
+      printf 'endpoint_process_path 必须是绝对路径: %s\n' "$expected_path" >&2
+      exit 7
+      ;;
+  esac
+
+  require_cmd lsof
+  port="$(endpoint_port)"
+  pids="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | sort -u || true)"
+  if [ -z "$pids" ] || [ "$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')" != "1" ]; then
+    printf 'CC Switch 监听进程身份校验失败：端口 %s 没有唯一监听者。\n' "$port" >&2
+    exit 7
+  fi
+  pid="$(printf '%s\n' "$pids" | head -1)"
+  actual_path="$(lsof -nP -a -p "$pid" -d txt -Fn 2>/dev/null |
+    sed -n 's/^n//p' | head -1)"
+  if [ "$(resolve_path "$actual_path")" != "$(resolve_path "$expected_path")" ]; then
+    printf 'CC Switch 监听进程身份不匹配：期望 %s，实际 %s。\n' \
+      "$expected_path" "${actual_path:-unknown}" >&2
+    exit 7
+  fi
+
+  expected_team="$(jq -r '.endpoint_macos_team_id // empty' "$CONFIG_FILE")"
+  expected_bundle="$(jq -r '.endpoint_macos_bundle_id // empty' "$CONFIG_FILE")"
+  expected_version="$(jq -r '.endpoint_macos_version // empty' "$CONFIG_FILE")"
+  if [ -n "$expected_team" ] || [ -n "$expected_bundle" ] || [ -n "$expected_version" ]; then
+    if [ "$(uname -s)" != "Darwin" ]; then
+      printf 'CC Switch 应用身份校验失败：macOS 身份字段只能在 Darwin 验证。\n' >&2
+      exit 7
+    fi
+  fi
+  if [ -n "$expected_team" ]; then
+    require_cmd codesign
+    if ! codesign --verify --strict "$actual_path" >/dev/null 2>&1; then
+      printf 'CC Switch 应用签名校验失败: %s\n' "$actual_path" >&2
+      exit 7
+    fi
+    signature="$(codesign -dv --verbose=4 "$actual_path" 2>&1 || true)"
+    team="$(printf '%s\n' "$signature" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+    if [ "$team" != "$expected_team" ]; then
+      printf 'CC Switch Team ID 不匹配：期望 %s，实际 %s。\n' \
+        "$expected_team" "${team:-unknown}" >&2
+      exit 7
+    fi
+  else
+    team="unpinned"
+  fi
+
+  if [ -n "$expected_bundle" ] || [ -n "$expected_version" ]; then
+    app_root="${expected_path%%.app/*}.app"
+    info_plist="$app_root/Contents/Info.plist"
+    if [ ! -f "$info_plist" ]; then
+      printf 'CC Switch Info.plist 不存在: %s\n' "$info_plist" >&2
+      exit 7
+    fi
+    bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)"
+    version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist" 2>/dev/null || true)"
+    if [ -n "$expected_bundle" ] && [ "$bundle" != "$expected_bundle" ]; then
+      printf 'CC Switch Bundle ID 不匹配：期望 %s，实际 %s。\n' \
+        "$expected_bundle" "${bundle:-unknown}" >&2
+      exit 7
+    fi
+    if [ -n "$expected_version" ] && [ "$version" != "$expected_version" ]; then
+      printf 'CC Switch 版本不匹配：期望 %s，实际 %s。\n' \
+        "$expected_version" "${version:-unknown}" >&2
+      exit 7
+    fi
+  else
+    bundle="unpinned"
+    version="unpinned"
+  fi
+
+  printf 'CC Switch 监听身份校验通过：pid=%s app=%s team=%s bundle=%s version=%s\n' \
+    "$pid" "$actual_path" "$team" "$bundle" "$version"
+}
+
+check_endpoint_protocol() {
+  local path method status expected
+
+  path="$(jq -r '.endpoint_probe_path // "/"' "$CONFIG_FILE")"
+  method="$(jq -r '.endpoint_probe_method // "HEAD"' "$CONFIG_FILE")"
+  expected="$(jq -r '(.endpoint_expected_statuses // [200,204,400,401,404,405]) | map(tostring) | join(" ")' "$CONFIG_FILE")"
+  if ! status="$(curl -sS -o /dev/null -X "$method" --connect-timeout 2 --max-time 5 \
+    -w '%{http_code}' "${EXPECTED_BASE_URL%/}${path}")"; then
+    printf '本机 CC Switch 端点不可达，已拒绝启动: %s\n' "$EXPECTED_BASE_URL" >&2
+    exit 7
+  fi
+  case " $expected " in
+    *" $status "*) ;;
+    *)
+      printf 'CC Switch 协议探针异常：%s %s 返回 HTTP %s，期望 %s。\n' \
+        "$method" "$path" "${status:-unknown}" "$expected" >&2
+      exit 7
+      ;;
+  esac
+  printf 'CC Switch 协议探针通过：%s %s HTTP %s\n' "$method" "$path" "$status"
+}
+
 if [ ! -f "$CONFIG_FILE" ]; then
   printf 'CC 通道配置不存在: %s\n' "$CONFIG_FILE" >&2
   exit 2
@@ -280,10 +398,9 @@ check_cli_policy "$@"
 check_project_route_policy
 check_client_identity
 
-if [ "$CHECK_ENDPOINT" = "true" ] &&
-  ! curl -sS -o /dev/null --connect-timeout 2 --max-time 5 "${EXPECTED_BASE_URL%/}/"; then
-  printf '本机 CC Switch 端点不可达，已拒绝启动: %s\n' "$EXPECTED_BASE_URL" >&2
-  exit 7
+if [ "$CHECK_ENDPOINT" = "true" ]; then
+  check_endpoint_process_identity
+  check_endpoint_protocol
 fi
 
 printf 'CC Switch 通道预检通过：profile=%s endpoint=%s\n' \

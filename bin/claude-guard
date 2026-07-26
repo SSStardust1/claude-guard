@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
-OFFICIAL_SETTINGS="${CLAUDE_GUARD_SETTINGS:-$HOME/.claude-official/settings.json}"
+OFFICIAL_SETTINGS_OVERRIDE="${CLAUDE_GUARD_SETTINGS:-}"
+OFFICIAL_CONFIG_DIR=""
+OFFICIAL_SETTINGS=""
 CA_CERT_FILE="${CLAUDE_GUARD_CA_CERT:-/etc/ssl/cert.pem}"
 CLAUDE_PROXY_URL="${CLAUDE_GUARD_PROXY:-${CLAUDE_OFFICIAL_PROXY:-http://127.0.0.1:7897}}"
 NO_PROXY_LIST="${CLAUDE_GUARD_NO_PROXY:-${CLAUDE_OFFICIAL_NO_PROXY:-127.0.0.1,localhost,::1,.local}}"
@@ -42,7 +44,7 @@ Usage:
 
 Environment:
   CLAUDE_GUARD_CONFIG        Safe config JSON. Default: ~/.safe-claude-official.json
-  CLAUDE_GUARD_SETTINGS      Official Claude settings. Default: ~/.claude-official/settings.json
+  CLAUDE_GUARD_SETTINGS      Override the settings file from config_dir.
   CLAUDE_GUARD_PROXY         Required proxy URL. Default: http://127.0.0.1:7897
   CLAUDE_GUARD_NO_PROXY      NO_PROXY list. Default: 127.0.0.1,localhost,::1,.local
   CLAUDE_GUARD_ASSUME_YES    Set to 1 to skip the final Enter prompt when IP is allowed.
@@ -67,6 +69,7 @@ Lifecycle policy:
 The config file must contain:
   {
     "command": "/absolute/path/to/original/claude",
+    "config_dir": "/absolute/path/to/versioned/profile",
     "allowed_ips": ["x.x.x.x"],
     "allowed_cidrs": ["x.x.x.0/24"]
   }
@@ -267,7 +270,7 @@ EOF
 }
 
 check_official_settings_policy() {
-  local missing risk_paths
+  local missing risk_paths pinned_model
 
   validate_json_file "$OFFICIAL_SETTINGS" "官方 settings"
 
@@ -276,6 +279,15 @@ check_official_settings_policy() {
     printf '官方 settings 含有路由、凭据、证书或重试策略改写，已拒绝启动: %s\n' "$OFFICIAL_SETTINGS" >&2
     printf '%s\n' "$risk_paths" | sed 's/^/  - /' >&2
     exit 5
+  fi
+
+  if jq -e '.require_unpinned_model // false' "$CONFIG_FILE" >/dev/null; then
+    pinned_model="$(jq -r '.model // empty' "$OFFICIAL_SETTINGS")"
+    if [ -n "$pinned_model" ]; then
+      printf '官方 settings 固定 model=%s，已拒绝启动；请让新版客户端自行选择模型或使用一次性的 --model。\n' \
+        "$pinned_model" >&2
+      exit 6
+    fi
   fi
 
   missing="$(jq -r '
@@ -598,7 +610,7 @@ check_legacy_profile_contamination() {
     exit 11
   fi
 
-  printf '旧默认 Claude profile 命中反代/凭据注入残留，但官方入口使用 CLAUDE_CONFIG_DIR=%s，按 warn 模式继续。\n' "$HOME/.claude-official" >&2
+  printf '旧默认 Claude profile 命中反代/凭据注入残留，但官方入口使用 CLAUDE_CONFIG_DIR=%s，按 warn 模式继续。\n' "$OFFICIAL_CONFIG_DIR" >&2
   log_guard "WARN" "legacy profile contains proxy/auth markers path=${profile}; official profile remains isolated"
 }
 
@@ -930,6 +942,13 @@ fi
 
 validate_json_file "$CONFIG_FILE" "IP 安全配置"
 CLAUDE_BIN="$(jq -r '.command // empty' "$CONFIG_FILE")"
+OFFICIAL_CONFIG_DIR="$(jq -r '.config_dir // empty' "$CONFIG_FILE")"
+[ -n "$OFFICIAL_CONFIG_DIR" ] || OFFICIAL_CONFIG_DIR="$HOME/.claude-official"
+if [ -n "$OFFICIAL_SETTINGS_OVERRIDE" ]; then
+  OFFICIAL_SETTINGS="$OFFICIAL_SETTINGS_OVERRIDE"
+else
+  OFFICIAL_SETTINGS="$OFFICIAL_CONFIG_DIR/settings.json"
+fi
 if [ -z "$CLAUDE_BIN" ]; then
   printf '配置中的 command 不能为空。\n' >&2
   exit 2
@@ -938,6 +957,13 @@ case "$CLAUDE_BIN" in
   /*) ;;
   *)
     printf '配置中的 command 必须是原始 Claude CLI 的绝对路径，不能写成: %s\n' "$CLAUDE_BIN" >&2
+    exit 2
+    ;;
+esac
+case "$OFFICIAL_CONFIG_DIR" in
+  /*) ;;
+  *)
+    printf '配置中的 config_dir 必须是绝对路径: %s\n' "$OFFICIAL_CONFIG_DIR" >&2
     exit 2
     ;;
 esac
@@ -1005,17 +1031,8 @@ else
   printf '正在使用未授权的网络环境。\n' >&2
   printf '允许的出口 IP/CIDR: ' >&2
   jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | join(", ")' "$CONFIG_FILE" >&2
-  if [ "$PRECHECK_ONLY" = "1" ]; then
-    printf '预检失败：未启动 Claude。\n' >&2
-    exit 4
-  fi
-  printf '如确认要冒险继续，请输入 unsafe 后回车；直接回车将退出: ' >&2
-  read -r answer
-  if [ "$answer" != "unsafe" ]; then
-    printf '已退出，未启动 Claude Official。\n' >&2
-    exit 4
-  fi
-  printf '已手动确认 unsafe，继续执行。\n' >&2
+  printf 'v%s 不提供 unsafe 绕过；已退出，未启动 Claude Official。\n' "$VERSION" >&2
+  exit 4
 fi
 
 start_watchdog_sidecar
@@ -1036,7 +1053,7 @@ exec env -i \
   all_proxy="$CLAUDE_PROXY_URL" \
   NO_PROXY="$NO_PROXY_LIST" \
   no_proxy="$NO_PROXY_LIST" \
-  CLAUDE_CONFIG_DIR="$HOME/.claude-official" \
+  CLAUDE_CONFIG_DIR="$OFFICIAL_CONFIG_DIR" \
   DISABLE_TELEMETRY="1" \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1" \
   DISABLE_UPDATES="1" \
