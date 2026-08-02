@@ -5,7 +5,7 @@ description: Claude Code 启动门禁与运行看门狗。启动前做 fail-clos
 
 # claude-guard — 启动门禁 + 运行看门狗 🚦
 
-## 这是什么（三十秒版）
+## 这是什么
 
 你以为你在跟官方 Claude 说话，其实 settings 里躺着上次调试留下的 `ANTHROPIC_BASE_URL`；
 你以为出口 IP 一直没变，其实跑到一半线路悄悄漂了。
